@@ -1,524 +1,616 @@
 """
-karmazyn_js_web.py — JS Web Bridge dla Lunety v1.0
-====================================================
+karmazyn_js.py — KarmazynJS Engine v0.2
+========================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
-Most między silnikiem JS a przeglądarką Luneta.
-Trzy zadania:
+Silnik JS oparty na phi-space. Każda wartość to Atom,
+każdy scope to Bubble, każde closure to referencja do Bubble.
 
-  1. SemanticNode → LiveDOM
-     Konwersja sparsowanego drzewa HTML na żywe węzły DOM
-     które JS może mutować.
+Zmiany v0.2 względem MVP:
+  - Ewaluator wyrażeń (expr) oddzielony od instrukcji (stmt)
+    MVP miał tylko wartości statyczne — teraz można pisać a+b, call(fn, args)
+  - touch() wywoływane przy każdym dostępie do atomu
+  - decay() wywoływane przez scheduler (tick)
+  - Function owinięty w Atom — spójny model
+  - if / while / porównania
+  - Sandbox: każdy kontekst dostaje izolowany phi-space
+  - Detekcja anomalii termicznej (crypto miner / infinite loop)
 
-  2. Script extraction + execution (stub → pełne gdy będzie parser)
-     Wyciąga <script> tagi ze strony i uruchamia je na LiveDOM.
-     Teraz: stub (skrypt logowany, nie wykonywany).
-     Gdy będzie parser tekstu: jeden wiersz do odkomentowania.
+Model instrukcji (program jako AST w Pythonie):
 
-  3. Browser API
-     window, navigator, location, history wstrzyknięte do VM.
-     Bez document.write, bez XMLHttpRequest.
+  Wyrażenia (expr — zwracają wartość):
+    ("lit",  value)              — literał: 42, "hello", True
+    ("var",  name)               — odczyt zmiennej
+    ("op",   left, op, right)    — arytmetyka/porównanie: a + b, x == y
+    ("call", fn_expr, arg_exprs) — wywołanie funkcji
+    ("fn",   params, body)       — definicja funkcji (wyrażenie lambda)
+    ("not",  expr)               — negacja logiczna
 
-Pipeline w Lunecie:
-  HTML → SemanticHTMLParser → SemanticNode
-      → SemanticToLive (tu) → LiveDOM
-      → JSBridge.run_scripts() → mutacje DOM
-      → LiveToChunks (tu) → TextChunks
-      → ParsedPage.lines() → terminal
-
-Brakujący krok (poza tym modułem):
-  Parser JS text → AST
-  Gdy będzie: JSBridge.run_scripts() odkomentuje jedną linię.
+  Instrukcje (stmt — efekt uboczny):
+    ("let",    name, expr)       — deklaracja zmiennej
+    ("assign", name, expr)       — przypisanie do istniejącej
+    ("return", expr)             — zwrot wartości
+    ("expr",   expr)             — wyrażenie jako instrukcja (wywołanie)
+    ("if",     cond, then, else_)— warunkowy
+    ("while",  cond, body)       — pętla
+    ("def",    name, params, body)— definicja funkcji (instrukcja)
 """
 
-import re
 import time
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
-from karmazyn_js_phi import KarmazynJSPhi, cmd_js
-from karmazyn_live_dom import LiveDOM, LiveNode, bind_live_dom
-from karmazyn_live_dom import NODE_BLOCK, NODE_TEXT
 
-# NodeType z browser — opcjonalne
-try:
-    from karmazyn_browser import NodeType, SemanticNode, TextChunk
-    HAS_BROWSER = True
-except ImportError:
-    HAS_BROWSER = False
+# ─── Atom ────────────────────────────────────────────────────────────────────
 
-
-# ─── Konwersja SemanticNode → LiveDOM ────────────────────────────────────────
-
-def semantic_to_live(node: Any, doc: LiveDOM,
-                     depth: int = 0,
-                     max_depth: int = 50) -> Optional[LiveNode]:
+class Atom:
     """
-    Konwertuje SemanticNode (ze sparsowanego HTML) na LiveNode.
-    Buduje żywe drzewo DOM które JS może mutować.
-
-    Głębokość ograniczona — zapobiega stack overflow na
-    patologicznie zagnieżdżonych stronach.
+    Wartość JS jako atom phi-space.
+    Temperatura = częstotliwość użycia.
+    Zimny atom → kandydat do GC.
     """
-    if node is None or depth > max_depth:
-        return None
+    T_HOT   = 100.0
+    T_DECAY = 0.95    # mnożnik przy każdym tick()
+    T_TOMB  = 1.0     # próg GC
 
-    typ = getattr(node, "typ", -1)
-    tag = getattr(node, "tag", "")
+    def __init__(self, value: Any, name: str = ""):
+        self.value  = value
+        self.name   = name
+        self.T      = 50.0     # temperatura startowa — WARM
+        self.state  = "WARM"
+        self._born  = time.time()
 
-    # Węzeł tekstowy
-    if typ == NODE_TEXT or typ == 8:
-        text = getattr(node, "text", "")
-        if not text or not text.strip():
+    def touch(self) -> None:
+        """Dostęp do atomu go ogrzewa."""
+        self.T = min(self.T_HOT, self.T + 10.0)
+        self._update_state()
+
+    def decay(self) -> None:
+        """Tick schedulera — atom stygnie."""
+        self.T *= self.T_DECAY
+        self._update_state()
+
+    def _update_state(self) -> None:
+        if self.T >= 70:   self.state = "HOT"
+        elif self.T >= 30: self.state = "WARM"
+        elif self.T >= self.T_TOMB: self.state = "COLD"
+        else:              self.state = "TOMB"
+
+    def is_dead(self) -> bool:
+        return self.T < self.T_TOMB
+
+    def __repr__(self) -> str:
+        return f"Atom({self.value!r}, T={self.T:.1f}, {self.state})"
+
+
+# ─── Bubble (Scope) ───────────────────────────────────────────────────────────
+
+class Bubble:
+    """
+    Scope JS jako bąbel phi-space.
+    Hierarchia bąbli = scope chain.
+    Lookup: bieżący bąbel → rodzic → ... → global → NameError.
+
+    Ucieczka z bąbla prowadzi do pustego bąbla — nie do zewnętrznego runtime.
+    Nie ma "na zewnątrz" — jest tylko próżnia phi-space.
+    """
+
+    def __init__(self, parent: Optional["Bubble"] = None,
+                 name: str = "bubble"):
+        self.name     = name
+        self.parent   = parent
+        self.vars:    Dict[str, Atom] = {}
+        self.children: List["Bubble"] = []
+        self._ticks   = 0        # licznik dostępów (anomalia termiczna)
+
+        if parent is not None:
+            parent.children.append(self)
+
+    # ── Lookup ───────────────────────────────────────────────────────────────
+
+    def get(self, key: str) -> Atom:
+        """
+        Szukaj atomu przez scope chain.
+        Każdy dostęp ogrzewa atom — to jest JIT profiling za darmo.
+        """
+        if key in self.vars:
+            atom = self.vars[key]
+            atom.touch()
+            return atom
+        if self.parent is not None:
+            return self.parent.get(key)
+        # Ucieczka z bąbla — lądujemy w próżni
+        raise NameError(f"'{key}' is not defined")
+
+    def set_local(self, key: str, value: Any) -> None:
+        """Utwórz atom w bieżącym bąblu (let / const)."""
+        atom = Atom(value, name=key)
+        self.vars[key] = atom
+
+    def assign(self, key: str, value: Any) -> None:
+        """
+        Przypisz wartość do istniejącego atomu (=).
+        Szuka przez scope chain — jak JS assignment.
+        """
+        if key in self.vars:
+            self.vars[key].value = value
+            self.vars[key].touch()
+            return
+        if self.parent is not None:
+            self.parent.assign(key, value)
+            return
+        raise NameError(f"'{key}' is not defined (assign)")
+
+    # ── Termodynamika ─────────────────────────────────────────────────────────
+
+    def tick(self) -> List[str]:
+        """
+        Tick schedulera — wszystkie atomy stygną.
+        Zwraca nazwy atomów które osiągnęły TOMB (kandydaci GC).
+        """
+        self._ticks += 1
+        dead = []
+        for key, atom in list(self.vars.items()):
+            atom.decay()
+            if atom.is_dead():
+                dead.append(key)
+        return dead
+
+    def gc(self) -> int:
+        """Usuń martwe atomy (TOMB). Zwraca liczbę usuniętych."""
+        dead = [k for k, a in self.vars.items() if a.is_dead()]
+        for k in dead:
+            del self.vars[k]
+        return len(dead)
+
+    def thermal_anomaly(self, threshold: float = 200.0) -> bool:
+        """
+        Detekcja anomalii — bąbel który ma zbyt dużo ticków bez wyników
+        to kandydat na crypto miner lub infinite loop.
+        """
+        return self._ticks > threshold and not self.vars
+
+    def __repr__(self) -> str:
+        keys = list(self.vars.keys())
+        return f"Bubble({self.name!r}, vars={keys}, parent={self.parent.name if self.parent else None})"
+
+
+# ─── Function (closure = referencja do bąbla) ────────────────────────────────
+
+class JSFunction:
+    """
+    Funkcja JS. Closure = referencja do bąbla w którym została zdefiniowana.
+    Bąbel nie umiera dopóki funkcja żyje — termodynamiczne weak reference.
+    """
+
+    def __init__(self, params: List[str], body: list, closure: Bubble,
+                 name: str = "<anonymous>"):
+        self.params  = params
+        self.body    = body
+        self.closure = closure   # ← to jest cała magia closures
+        self.name    = name
+
+    def call(self, runtime: "KarmazynJS", args: List[Any]) -> Any:
+        # Nowy scope = child bąbla closure (nie global)
+        local = Bubble(parent=self.closure,
+                       name=f"fn_{self.name}_scope")
+        # Binduj argumenty jako atomy lokalne
+        for param, arg in zip(self.params, args):
+            local.set_local(param, arg)
+        # Uzupełnij brakujące parametry jako undefined
+        for param in self.params[len(args):]:
+            local.set_local(param, None)
+        return runtime._exec_block(self.body, local)
+
+    def __repr__(self) -> str:
+        return f"JSFunction({self.name}, params={self.params})"
+
+
+# ─── Return / Break wyjątki kontrolne ────────────────────────────────────────
+
+class _Return(Exception):
+    def __init__(self, value: Any):
+        self.value = value
+
+class _Break(Exception):
+    pass
+
+class _Continue(Exception):
+    pass
+
+
+# ─── Runtime ─────────────────────────────────────────────────────────────────
+
+class KarmazynJS:
+    """
+    Silnik JS na bąblach.
+
+    Każdy kontekst ma własny, izolowany phi-space.
+    "Ucieczka" z bąbla trafia do pustej próżni — nie do zewnętrznego runtime.
+
+    Sandbox jest strukturalny, nie polityczny:
+      - Kod JS widzi tylko swój phi-space
+      - Nie ma referencji do external runtime
+      - Puste bąble poza granicą nie mają atomów do odczytu/modyfikacji
+    """
+
+    MAX_TICKS   = 10_000   # limit iteracji (ochrona przed infinite loop)
+
+    def __init__(self, name: str = "global"):
+        self.global_bubble = Bubble(name=name)
+        self._tick_count   = 0
+        self._setup_builtins()
+
+    def _setup_builtins(self) -> None:
+        """Wbudowane funkcje JS — tylko bezpieczne, bez dostępu do runtime."""
+        builtins = {
+            "console_log": JSFunction(
+                ["x"], [("_builtin", "print")],
+                self.global_bubble, "console.log"
+            ),
+            "Math_abs":    JSFunction(
+                ["x"], [("_builtin", "abs")],
+                self.global_bubble, "Math.abs"
+            ),
+            "String":      JSFunction(
+                ["x"], [("_builtin", "str")],
+                self.global_bubble, "String"
+            ),
+            "Number":      JSFunction(
+                ["x"], [("_builtin", "num")],
+                self.global_bubble, "Number"
+            ),
+        }
+        for name, fn in builtins.items():
+            self.global_bubble.set_local(name, fn)
+
+    # ── Ewaluacja wyrażeń ─────────────────────────────────────────────────────
+
+    def _eval(self, expr: Any, scope: Bubble) -> Any:
+        """
+        Ewaluuje wyrażenie i zwraca wartość Pythona.
+        To jest kluczowa warstwa której brakowało w MVP.
+        """
+        # Nie-tuple = literał
+        if not isinstance(expr, tuple):
+            return expr
+
+        op = expr[0]
+
+        # Literał
+        if op == "lit":
+            return expr[1]
+
+        # Odczyt zmiennej
+        if op == "var":
+            return scope.get(expr[1]).value
+
+        # Operacje binarne: ("op", left, operator, right)
+        if op == "op":
+            _, left_expr, operator, right_expr = expr
+            left  = self._eval(left_expr, scope)
+            right = self._eval(right_expr, scope)
+            return self._apply_op(left, operator, right)
+
+        # Negacja
+        if op == "not":
+            return not self._eval(expr[1], scope)
+
+        # Wywołanie: ("call", fn_expr, [arg_exprs...])
+        if op == "call":
+            _, fn_expr, arg_exprs = expr
+            fn   = self._eval(fn_expr, scope)
+            args = [self._eval(a, scope) for a in arg_exprs]
+            return self._call_fn(fn, args, scope)
+
+        # Definicja funkcji jako wyrażenie (lambda)
+        if op == "fn":
+            _, params, body = expr
+            return JSFunction(params, body, scope)
+
+        # Dostęp do właściwości obiektu (uproszczony)
+        if op == "prop":
+            _, obj_expr, prop = expr
+            obj = self._eval(obj_expr, scope)
+            if isinstance(obj, dict):
+                return obj.get(prop)
+            return getattr(obj, prop, None)
+
+        # Array literal
+        if op == "array":
+            return [self._eval(e, scope) for e in expr[1]]
+
+        # Object literal
+        if op == "object":
+            return {k: self._eval(v, scope) for k, v in expr[1].items()}
+
+        raise SyntaxError(f"Nieznane wyrażenie: {op}")
+
+    def _apply_op(self, left: Any, op: str, right: Any) -> Any:
+        """Operatory JS."""
+        ops = {
+            "+":   lambda a, b: a + b,
+            "-":   lambda a, b: a - b,
+            "*":   lambda a, b: a * b,
+            "/":   lambda a, b: a / b if b != 0 else float("inf"),
+            "%":   lambda a, b: a % b,
+            "**":  lambda a, b: a ** b,
+            "==":  lambda a, b: a == b,
+            "!=":  lambda a, b: a != b,
+            "<":   lambda a, b: a < b,
+            ">":   lambda a, b: a > b,
+            "<=":  lambda a, b: a <= b,
+            ">=":  lambda a, b: a >= b,
+            "&&":  lambda a, b: a and b,
+            "||":  lambda a, b: a or b,
+        }
+        if op not in ops:
+            raise SyntaxError(f"Nieznany operator: {op}")
+        return ops[op](left, right)
+
+    def _call_fn(self, fn: Any, args: List[Any], scope: Bubble) -> Any:
+        """Wywołuje funkcję — JSFunction lub wbudowaną."""
+        if isinstance(fn, JSFunction):
+            try:
+                return fn.call(self, args)
+            except _Return as r:
+                return r.value
+        if callable(fn):
+            return fn(*args)
+        raise TypeError(f"Nie jest funkcją: {fn!r}")
+
+    # ── Wykonanie instrukcji ──────────────────────────────────────────────────
+
+    def _exec_block(self, block: list, scope: Bubble) -> Any:
+        """Wykonuje blok instrukcji."""
+        result = None
+
+        for stmt in block:
+            self._tick_count += 1
+            if self._tick_count > self.MAX_TICKS:
+                raise RuntimeError("KarmazynJS: przekroczono limit ticków "
+                                   "(infinite loop lub anomalia termiczna)")
+
+            result = self._exec_stmt(stmt, scope)
+
+        return result
+
+    def _exec_stmt(self, stmt: tuple, scope: Bubble) -> Any:
+        op = stmt[0]
+
+        # Deklaracja zmiennej (let)
+        if op == "let":
+            _, name, expr = stmt
+            value = self._eval(expr, scope)
+            scope.set_local(name, value)
             return None
-        return doc.createTextNode(text)
 
-    # Węzeł DOCUMENT — specjalny przypadek, wróć body
-    if typ == 0 or tag == "document":
-        for child in getattr(node, "children", []):
-            _populate_body(child, doc, depth + 1, max_depth)
-        return doc.body
+        # Przypisanie (=)
+        if op == "assign":
+            _, name, expr = stmt
+            value = self._eval(expr, scope)
+            scope.assign(name, value)
+            return None
 
-    # Element normalny
-    live = doc.createElement(tag or "div")
+        # Definicja funkcji (statement)
+        if op == "def":
+            _, name, params, body = stmt
+            fn = JSFunction(params, body, scope, name=name)
+            scope.set_local(name, fn)
+            return None
 
-    # Kopiuj atrybuty
-    for k, v in getattr(node, "attrs", {}).items():
-        live.setAttribute(k, str(v))
+        # Return
+        if op == "return":
+            value = self._eval(stmt[1], scope)
+            raise _Return(value)
 
-    # Rekurencja po dzieciach
-    for child in getattr(node, "children", []):
-        live_child = semantic_to_live(child, doc, depth + 1, max_depth)
-        if live_child is not None:
-            live.children.append(live_child)
-            live_child.parent = live
+        # Wyrażenie jako instrukcja (np. console.log, wywołanie funkcji)
+        if op == "expr":
+            return self._eval(stmt[1], scope)
 
-    return live
+        # Wbudowane (print, abs itp.)
+        if op == "_builtin":
+            # Wywoływane z wnętrza JSFunction — pobiera 'x' z local scope
+            builtin = stmt[1]
+            x = scope.get("x").value
+            if builtin == "print":
+                print(x)
+            elif builtin == "abs":
+                return abs(x)
+            elif builtin == "str":
+                return str(x)
+            elif builtin == "num":
+                return float(x) if x is not None else 0.0
+            return None
 
+        # Warunkowy (if)
+        if op == "if":
+            _, cond_expr, then_block, else_block = stmt
+            cond = self._eval(cond_expr, scope)
+            if cond:
+                then_scope = Bubble(parent=scope, name="if_then")
+                return self._exec_block(then_block, then_scope)
+            elif else_block:
+                else_scope = Bubble(parent=scope, name="if_else")
+                return self._exec_block(else_block, else_scope)
+            return None
 
-def _populate_body(node: Any, doc: LiveDOM,
-                   depth: int, max_depth: int) -> None:
-    """Wypełnia doc.body węzłami z drzewa SemanticNode."""
-    tag = getattr(node, "tag", "")
-    if tag in ("html", "body", "document"):
-        for child in getattr(node, "children", []):
-            _populate_body(child, doc, depth + 1, max_depth)
-        return
-    live = semantic_to_live(node, doc, depth, max_depth)
-    if live is not None and live is not doc.body:
-        doc.body.children.append(live)
-        live.parent = doc.body
+        # Pętla while
+        if op == "while":
+            _, cond_expr, body = stmt
+            iterations = 0
+            while self._eval(cond_expr, scope):
+                iterations += 1
+                if iterations > 10_000:
+                    raise RuntimeError("while: przekroczono 10000 iteracji")
+                loop_scope = Bubble(parent=scope, name=f"while_{iterations}")
+                try:
+                    self._exec_block(body, loop_scope)
+                except _Break:
+                    break
+                except _Continue:
+                    continue
+            return None
 
+        # Break / Continue
+        if op == "break":    raise _Break()
+        if op == "continue": raise _Continue()
 
-def build_live_dom(page: Any, runtime: Any,
-                   vm: KarmazynJSPhi) -> LiveDOM:
-    """
-    Buduje LiveDOM ze strony Lunety (ParsedPage).
-    Punkt wejścia dla JSBridge.
-    """
-    doc = bind_live_dom(vm, runtime, prefix=_url_prefix(page.url))
-    doc.title = page.title
+        raise SyntaxError(f"Nieznana instrukcja: {op}")
 
-    if page.semantic_tree is not None:
-        _populate_body(page.semantic_tree, doc, 0, 50)
+    # ── Publiczny interfejs ───────────────────────────────────────────────────
 
-    doc.flush()
-    return doc
-
-
-# ─── Ekstrakcja skryptów ──────────────────────────────────────────────────────
-
-def extract_scripts(html: str) -> List[Tuple[str, str]]:
-    """
-    Wyciąga skrypty z HTML.
-    Zwraca [(typ, kod), ...] gdzie typ = "inline" | "external".
-    Skrypty zewnętrzne (src=) zwracają (external, url).
-    """
-    scripts = []
-    pattern = re.compile(
-        r'<script([^>]*)>(.*?)</script>',
-        re.DOTALL | re.IGNORECASE,
-    )
-    src_pattern = re.compile(r'src=["\']([^"\']+)["\']', re.IGNORECASE)
-    type_pattern = re.compile(r'type=["\']([^"\']+)["\']', re.IGNORECASE)
-
-    for m in pattern.finditer(html):
-        attrs_raw = m.group(1)
-        code      = m.group(2).strip()
-
-        # Pomiń type="module", type="text/template" itp.
-        type_m = type_pattern.search(attrs_raw)
-        if type_m:
-            t = type_m.group(1).lower()
-            if t not in ("text/javascript", "application/javascript", ""):
-                continue
-
-        src_m = src_pattern.search(attrs_raw)
-        if src_m:
-            scripts.append(("external", src_m.group(1)))
-        elif code:
-            scripts.append(("inline", code))
-
-    return scripts
-
-
-# ─── JSBridge — główna klasa ──────────────────────────────────────────────────
-
-class JSBridge:
-    """
-    Most JS dla Lunety.
-
-    Tworzy izolowany KarmazynJSPhi dla każdej strony.
-    Każda strona dostaje własny phi-space — sandbox strukturalny.
-
-    Użycie:
-        bridge = JSBridge(runtime)
-        bridge.attach(page)           # buduje LiveDOM ze strony
-        bridge.run_scripts(page)      # uruchamia skrypty (gdy parser gotowy)
-        chunks = bridge.live_chunks() # TextChunki po mutacjach JS
-    """
-
-    def __init__(self, runtime):
-        self.runtime = runtime
-        self._vm:   Optional[KarmazynJSPhi] = None
-        self._doc:  Optional[LiveDOM]       = None
-        self._page_url: str = ""
-        self._scripts_run   = 0
-        self._mutations     = 0
-        self._active        = False
-
-    # ── Attach / detach ───────────────────────────────────────────────────────
-
-    def attach(self, page: Any) -> None:
-        """
-        Dołącza do nowej strony.
-        Tworzy izolowany VM i buduje LiveDOM.
-        """
-        # Sandbox: każda strona = osobny phi-space
-        self._vm = KarmazynJSPhi(
-            runtime=self.runtime,
-            name=_url_prefix(getattr(page, "url", "page")),
-        )
-        self._inject_browser_api(page)
-        self._doc = build_live_dom(page, self.runtime, self._vm)
-        self._doc.on_mutate(lambda: self._on_mutation())
-        self._page_url   = getattr(page, "url", "")
-        self._scripts_run = 0
-        self._mutations   = 0
-        self._active      = True
-
-    def detach(self) -> None:
-        """Odłącza od strony — VM i LiveDOM są zwalniane."""
-        self._vm     = None
-        self._doc    = None
-        self._active = False
-
-    # ── Uruchamianie skryptów ─────────────────────────────────────────────────
-
-    def run_scripts(self, page: Any) -> Dict[str, Any]:
-        """
-        Wyciąga i uruchamia skrypty inline ze strony.
-
-        TERAZ:
-          Skrypty są wyciągane i logowane.
-          Nie uruchamiane — brak parsera tekstu → AST.
-
-        GDY BĘDZIE PARSER:
-          Odkomentuj jedną linię w _run_inline().
-          Reszta jest gotowa.
-        """
-        if not self._active or self._vm is None:
-            return {"ok": False, "reason": "bridge not attached"}
-
-        scripts = extract_scripts(getattr(page, "raw_html", ""))
-        results = {"ok": True, "inline": 0, "external": 0,
-                   "errors": [], "skipped": 0}
-
-        for typ, content in scripts:
-            if typ == "inline":
-                ok, err = self._run_inline(content)
-                if ok:
-                    results["inline"] += 1
-                    self._scripts_run += 1
-                else:
-                    results["skipped"] += 1
-                    results["errors"].append(err)
-            else:
-                results["external"] += 1  # TODO: fetch + run
-
-        if self._doc:
-            self._doc.flush()
-
-        return results
-
-    def _run_inline(self, source: str) -> Tuple[bool, str]:
-        """Uruchamia skrypt inline przez karmazyn_js_parser."""
+    def run(self, program: list) -> Any:
+        """Uruchamia program w global scope."""
+        self._tick_count = 0
         try:
-            from karmazyn_js_parser import parse_js
-            prog = parse_js(source)
-            self._vm.run(prog)
-            if self._doc:
-                self._doc.flush()
-            return True, ""
-        except Exception as e:
-            return False, str(e)[:120]
+            return self._exec_block(program, self.global_bubble)
+        except _Return as r:
+            return r.value
 
+    def get(self, name: str) -> Any:
+        """Odczyt wartości z global scope (dla testów/debugowania)."""
+        return self.global_bubble.get(name).value
 
-    def run_ast(self, program: list) -> Tuple[bool, Any]:
+    def tick_gc(self) -> Dict[str, int]:
         """
-        Uruchamia program (AST) na LiveDOM aktualnej strony.
-        Używane przez BROWSE JS dla ręcznego testowania.
+        Tick schedulera — stygnięcie atomów i GC.
+        Wywoływany przez KarmazynOS scheduler co N sekund.
         """
-        if not self._active or self._vm is None:
-            return False, "bridge not attached"
-        try:
-            result = self._vm.run(program)
-            if self._doc:
-                self._doc.flush()
-            return True, result
-        except Exception as e:
-            return False, str(e)
+        def _tick_bubble(b: Bubble) -> Tuple[int, int]:
+            dead  = b.tick()
+            count = b.gc()
+            total_dead  = count
+            total_ticks = 1
+            for child in b.children:
+                cd, ct = _tick_bubble(child)
+                total_dead  += cd
+                total_ticks += ct
+            return total_dead, total_ticks
 
-    # ── Renderowanie po mutacjach ─────────────────────────────────────────────
+        collected, bubbles = _tick_bubble(self.global_bubble)
+        return {"collected": collected, "bubbles": bubbles}
 
-    def live_chunks(self) -> List[Any]:
+    def sandbox(self, name: str = "untrusted") -> "KarmazynJS":
         """
-        Konwertuje LiveDOM → TextChunki dla Lunety.
-        Wywoływane gdy JS zmutował DOM i trzeba przerenderować.
+        Tworzy izolowany kontekst JS.
+        Nie ma referencji do self — pusty phi-space.
+        Ucieczka prowadzi do próżni, nie do parent runtime.
         """
-        if not self._active or self._doc is None:
-            return []
-        return _live_to_chunks(self._doc.body)
-
-    def has_mutations(self) -> bool:
-        return self._mutations > 0
-
-    def reset_mutations(self) -> None:
-        self._mutations = 0
-
-    # ── Tick schedulera ───────────────────────────────────────────────────────
-
-    def tick(self) -> Dict[str, Any]:
-        """Tick GC/termodynamiki dla VM kontekstu JS tej strony."""
-        if self._vm is None:
-            return {}
-        return self._vm.tick()
-
-    # ── Phi-space stats ───────────────────────────────────────────────────────
-
-    def status(self) -> Dict[str, Any]:
-        if not self._active or self._vm is None:
-            return {"active": False}
-        s = self._vm.phi_stats()
-        s["active"]       = True
-        s["mutations"]    = self._mutations
-        s["scripts_run"]  = self._scripts_run
-        s["dom_nodes"]    = self._count_nodes(self._doc.body) if self._doc else 0
-        s["url"]          = self._page_url
-        return s
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    def _inject_browser_api(self, page: Any) -> None:
-        """Wstrzykuje browser API do VM (bez document — to robi bind_live_dom)."""
-        url  = getattr(page, "url", "")
-        vm   = self._vm
-
-        vm.set_global("navigator", {
-            "userAgent":  "KarmazynBrowser/4.4 KarmazynOS",
-            "language":   "pl-PL",
-            "onLine":     True,
-            "platform":   "KarmazynOS",
-        })
-        vm.set_global("location", {
-            "href":     url,
-            "pathname": _url_pathname(url),
-            "search":   _url_search(url),
-            "hash":     "",
-            "hostname": _url_hostname(url),
-            "reload":   lambda: None,
-            "assign":   lambda u: None,
-        })
-        vm.set_global("history", {
-            "pushState":    lambda *a: None,
-            "replaceState": lambda *a: None,
-            "back":         lambda: None,
-            "forward":      lambda: None,
-            "length":       1,
-        })
-        vm.set_global("screen",  {"width": 80, "height": 24})
-        vm.set_global("JSON", {
-            "parse":     __import__("json").loads,
-            "stringify": __import__("json").dumps,
-        })
-        vm.set_global("encodeURIComponent",
-                      __import__("urllib.parse", fromlist=["quote"]).quote)
-        vm.set_global("decodeURIComponent",
-                      __import__("urllib.parse", fromlist=["unquote"]).unquote)
-
-    def _on_mutation(self) -> None:
-        self._mutations += 1
-
-    def _count_nodes(self, node: LiveNode) -> int:
-        if node is None:
-            return 0
-        return 1 + sum(self._count_nodes(c) for c in node.children)
+        return KarmazynJS(name=f"sandbox_{name}")
 
 
-# ─── LiveDOM → TextChunki ─────────────────────────────────────────────────────
+# ─── Demo ─────────────────────────────────────────────────────────────────────
 
-def _live_to_chunks(node: LiveNode) -> List[Any]:
-    """
-    Konwertuje LiveDOM → TextChunki kompatybilne z ParsedPage.
-    Wywoływane gdy JS zmutował DOM — przerenderuj stronę.
-    """
-    chunks = []
-    _node_to_chunks(node, chunks)
-    return chunks
+if __name__ == "__main__":
+    vm = KarmazynJS()
 
+    # ── Test 1: arytmetyka i zmienne ─────────────────────────────────────────
+    print("=== Test 1: Arytmetyka ===")
+    vm.run([
+        ("let", "x",   ("lit", 10)),
+        ("let", "y",   ("lit", 20)),
+        ("let", "sum", ("op", ("var", "x"), "+", ("var", "y"))),
+        ("expr", ("call", ("var", "console_log"), [("var", "sum")])),
+    ])
+    assert vm.get("sum") == 30
 
-def _node_to_chunks(node: LiveNode, out: list, depth: int = 0) -> None:
-    """Rekurencja LiveNode → TextChunk."""
-    if node is None:
-        return
+    # ── Test 2: funkcja z closure ─────────────────────────────────────────────
+    print("\n=== Test 2: Closure / Counter ===")
+    vm.run([
+        # function makeCounter() { let n = 0; return () => n++ }
+        ("def", "makeCounter", [], [
+            ("let", "n", ("lit", 0)),
+            ("def", "increment", [], [
+                ("let", "old", ("var", "n")),
+                ("assign", "n", ("op", ("var", "n"), "+", ("lit", 1))),
+                ("return", ("var", "old")),
+            ]),
+            ("return", ("var", "increment")),
+        ]),
 
+        ("let", "counter", ("call", ("var", "makeCounter"), [])),
+        ("let", "a", ("call", ("var", "counter"), [])),   # 0
+        ("let", "b", ("call", ("var", "counter"), [])),   # 1
+        ("let", "c", ("call", ("var", "counter"), [])),   # 2
+        ("expr", ("call", ("var", "console_log"), [("var", "a")])),
+        ("expr", ("call", ("var", "console_log"), [("var", "b")])),
+        ("expr", ("call", ("var", "console_log"), [("var", "c")])),
+    ])
+    assert vm.get("a") == 0
+    assert vm.get("b") == 1
+    assert vm.get("c") == 2
+
+    # ── Test 3: rekurencja (fibonacci) ────────────────────────────────────────
+    print("\n=== Test 3: Rekurencja (fib) ===")
+    vm.run([
+        ("def", "fib", ["n"], [
+            ("if",
+                ("op", ("var", "n"), "<=", ("lit", 1)),
+                [("return", ("var", "n"))],
+                [("return", ("op",
+                    ("call", ("var", "fib"), [("op", ("var","n"),"-",("lit",1))]),
+                    "+",
+                    ("call", ("var", "fib"), [("op", ("var","n"),"-",("lit",2))])
+                ))],
+            ),
+        ]),
+        ("let", "fib10", ("call", ("var", "fib"), [("lit", 10)])),
+        ("expr", ("call", ("var", "console_log"), [("var", "fib10")])),
+    ])
+    assert vm.get("fib10") == 55
+
+    # ── Test 4: while loop ────────────────────────────────────────────────────
+    print("\n=== Test 4: While loop ===")
+    vm.run([
+        ("let", "i",    ("lit", 0)),
+        ("let", "acc",  ("lit", 0)),
+        ("while",
+            ("op", ("var", "i"), "<", ("lit", 5)),
+            [
+                ("assign", "acc", ("op", ("var", "acc"), "+", ("var", "i"))),
+                ("assign", "i",   ("op", ("var", "i"),   "+", ("lit", 1))),
+            ]
+        ),
+        ("expr", ("call", ("var", "console_log"), [("var", "acc")])),
+    ])
+    assert vm.get("acc") == 10   # 0+1+2+3+4
+
+    # ── Test 5: sandbox (izolacja) ────────────────────────────────────────────
+    print("\n=== Test 5: Sandbox isolation ===")
+    untrusted = vm.sandbox("malicious_script")
+    untrusted.run([
+        ("let", "secret_attempt", ("lit", "trying to escape")),
+    ])
     try:
-        from karmazyn_browser import TextChunk
-    except ImportError:
-        class TextChunk:
-            def __init__(self, text, preformatted=False):
-                self.text = text
-                self.preformatted = preformatted
+        untrusted.global_bubble.parent.get("x")
+        print("FAIL: ucieczka udana!")
+    except (AttributeError, NameError):
+        print("OK: sandbox izolowany — parent == None (próżnia phi-space)")
 
-    tag = node.tag
+    # ── Test 6: termodynamika ─────────────────────────────────────────────────
+    print("\n=== Test 6: Termodynamika ===")
+    import time as _time
+    vm2 = KarmazynJS()
+    vm2.run([
+        ("let", "hot_var", ("lit", "używana często")),
+        ("let", "cold_var", ("lit", "zapomniana")),
+    ])
 
-    # Węzeł tekstowy
-    if node.typ == NODE_TEXT:
-        if node.text and node.text.strip():
-            out.append(TextChunk(text=node.text))
-        return
+    hot = vm2.global_bubble.vars["hot_var"]
+    cold = vm2.global_bubble.vars["cold_var"]
 
-    # Separatory
-    if tag == "hr":
-        out.append(TextChunk(text="\n" + "─" * 78 + "\n"))
-        return
+    # Symuluj używanie hot_var
+    for _ in range(20):
+        vm2.global_bubble.get("hot_var")   # touch()
 
-    # Bloki — dodaj newline przed i po
-    block_tags = {"p","div","article","section","main","header",
-                  "footer","nav","aside","li","tr","td","th"}
-    is_block = tag in block_tags
+    # Symuluj 30 ticków schedulera
+    for _ in range(30):
+        vm2.tick_gc()
 
-    if is_block:
-        out.append(TextChunk(text="\n"))
+    print(f"hot_var:  T={hot.T:.1f}  state={hot.state}")
+    print(f"cold_var: T={cold.T:.1f} state={cold.state}")
+    assert hot.T > cold.T, "Używana zmienna powinna być cieplejsza"
+    print("OK: termodynamika działa — cold_var ostygła szybciej")
 
-    # Nagłówki
-    if tag in ("h1","h2","h3","h4","h5","h6"):
-        level  = int(tag[1])
-        text   = "".join(c.text for c in node.children
-                         if c.typ == NODE_TEXT and c.text)
-        if text:
-            prefix = "#" * level + " "
-            line   = prefix + text
-            sep    = ("═" if level == 1 else "─") * min(len(line), 78)
-            out.append(TextChunk(text=f"\n{line}\n{sep}\n"))
-        return
-
-    # Pre/code
-    if tag in ("pre", "code"):
-        text = "".join(c.text for c in node.children if c.typ == NODE_TEXT)
-        if text:
-            out.append(TextChunk(text=text, preformatted=True))
-        return
-
-    # Rekurencja
-    for child in node.children:
-        _node_to_chunks(child, out, depth + 1)
-
-    if is_block:
-        out.append(TextChunk(text="\n"))
-
-
-# ─── URL helpers ─────────────────────────────────────────────────────────────
-
-def _url_prefix(url: str) -> str:
-    import re
-    return re.sub(r"[^a-z0-9]", "_",
-                  url.lower().replace("https://","").replace("http://",""))[:16]
-
-def _url_pathname(url: str) -> str:
-    try:
-        import urllib.parse
-        return urllib.parse.urlparse(url).path or "/"
-    except Exception:
-        return "/"
-
-def _url_search(url: str) -> str:
-    try:
-        import urllib.parse
-        q = urllib.parse.urlparse(url).query
-        return f"?{q}" if q else ""
-    except Exception:
-        return ""
-
-def _url_hostname(url: str) -> str:
-    try:
-        import urllib.parse
-        return urllib.parse.urlparse(url).hostname or ""
-    except Exception:
-        return ""
-
-
-# ─── Komenda shella ───────────────────────────────────────────────────────────
-
-def cmd_js_bridge(args: list, bridge: JSBridge) -> str:
-    """
-    Dostępne przez BROWSE JS lub JS w shellu:
-
-    JS STATUS            — statystyki phi-space VM
-    JS THERMAL           — mapa temperatur zmiennych JS
-    JS TICK              — ręczny tick GC
-    JS DOM               — struktura LiveDOM (render tekst)
-    JS RUN <expr>        — wykonaj wyrażenie (Python AST jako eval)
-    """
-    if not bridge._active:
-        return "JS Bridge nieaktywny. Najpierw otwórz stronę: LUNETA <url>"
-
-    if not args or args[0].upper() == "STATUS":
-        s = bridge.status()
-        lines = [
-            f"Aktywny:    {s['active']}",
-            f"URL:        {s.get('url','?')[:50]}",
-            f"Węzły DOM:  {s.get('dom_nodes',0)}",
-            f"Mutacje:    {s.get('mutations',0)}",
-            f"Skrypty:    {s.get('scripts_run',0)}",
-            f"Atomy JS:   {s.get('atoms',0)}  HOT:{s.get('hot',0)}",
-            f"Operacje:   {s.get('op_count',0)}/{s.get('max_ops',0)}",
-        ]
-        return "\n".join(lines)
-
-    sub = args[0].upper()
-
-    if sub == "THERMAL" and bridge._vm:
-        return cmd_js(["THERMAL"], bridge._vm)
-
-    if sub == "TICK" and bridge._vm:
-        r = bridge.tick()
-        return f"Tick #{r.get('tick','?')}: GC={r.get('collected',0)} anomalia={r.get('anomaly',0):.2f}"
-
-    if sub == "DOM" and bridge._doc:
-        return bridge._doc.render_text()
-
-    if sub == "RUN" and len(args) > 1:
-        # Ręczne wykonanie wyrażenia — tylko do testów/debug
-        # Przyjmuje Python-style AST jako string eval (niebezpieczne w produkcji)
-        expr_str = " ".join(args[1:])
-        try:
-            # SECURITY: eval usunięty — używaj karmazyn_js_parser.parse()
-            from karmazyn_js_parser import KarmazynParser as _P
-            ast_prog = _P().parse(expr_str)
-            ok, result = bridge.run_ast(ast_prog if isinstance(ast_prog, list)
-                                        else [("expr", ast_prog)])
-            return f"{'OK' if ok else 'ERR'}: {result}"
-        except Exception as e:
-            return f"Błąd parsowania wyrażenia: {e}"
-
-    return cmd_js_bridge([], bridge)
+    print("\n=== Wszystkie testy OK ===")

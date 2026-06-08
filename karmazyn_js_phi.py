@@ -1,5 +1,5 @@
 """
-karmazyn_js_phi.py — KarmazynJS Phi Layer v1.0
+karmazyn_js_phi.py — KarmazynJS Phi Layer v1.1
 ================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
@@ -15,15 +15,13 @@ Warstwa phi-space:
   PhiAtom   — wartość JS jako atom phi-space
   KarmazynJSPhi — Core + phi-space
 
-Bezpieczeństwo przez strukturę:
-  sandbox() → izolowany phi-space bez referencji do parent
-  "Ucieczka" z bąbla → pusty phi-space (próżnia)
-  Nie polityka — ontologia.
-
-Anomaly detection (darmowe z termodynamiki):
-  Kod który za dużo czyta bez produkcji → podejrzany
-  Bąbel który rośnie bez ograniczeń → leak
-  Nieskończona pętla → op_count limit w Core
+Zmiany v1.1:
+  - FIX: override _call() → PhiScope zamiast Scope (Bug 1)
+  - FIX: _prune_dead_children() w tick — czyszczenie martwych scope'ów (Bug 5)
+  - NEW: PhiScope.scope_name, .depth — metadane śledzenia
+  - NEW: scope_tree() — pełne drzewo scope'ów dla debugowania
+  - NEW: cmd_js TREE — komenda shella
+  - NEW: phi_stats() zawiera scope_count i scope_depth
 """
 
 import time
@@ -102,16 +100,26 @@ class PhiAtom:
 
 class PhiScope(Scope):
     """
-    Scope z termodynamiką.
+    Scope z termodynamiką i śledzeniem dzieci.
     Każda zmienna to PhiAtom — dostęp ogrzewa, brak dostępu stygnie.
+
+    Śledzenie drzewa scope'ów:
+      scope_name  — nazwa czytelna (fn_counter, for_body, if_then)
+      depth       — głębokość zagnieżdżenia (global=0)
+      children    — lista żywych dzieci (przycinana w tick)
+      _born       — czas utworzenia (monotonic)
 
     Rozszerza Scope z Core — Core nie wie o temperaturach.
     """
 
-    def __init__(self, parent: Optional["PhiScope"] = None):
+    def __init__(self, parent: Optional["PhiScope"] = None,
+                 scope_name: str = ""):
         super().__init__(parent)
         self._atoms: Dict[str, PhiAtom] = {}
         self.children: List["PhiScope"] = []
+        self.scope_name = scope_name
+        self.depth      = (parent.depth + 1) if isinstance(parent, PhiScope) else 0
+        self._born      = time.monotonic()
         if parent is not None and isinstance(parent, PhiScope):
             parent.children.append(self)
 
@@ -152,12 +160,14 @@ class PhiScope(Scope):
 
     def child(self, name: str = "") -> "PhiScope":
         """Zwraca nowy PhiScope zagnieżdżony w bieżącym."""
-        return PhiScope(parent=self)
+        return PhiScope(parent=self, scope_name=name)
 
     def detach_child(self, child_scope: "PhiScope") -> None:
         """Odłącza dziecko z listy children."""
         if child_scope in self.children:
             self.children.remove(child_scope)
+
+    # ── Termodynamika ─────────────────────────────────────────────────────────
 
     def tick(self) -> List[str]:
         """
@@ -180,8 +190,43 @@ class PhiScope(Scope):
                 count += 1
         return count
 
+    def is_empty(self) -> bool:
+        """Scope bez atomów i bez dzieci — kandydat do przycinania."""
+        return len(self._atoms) == 0 and len(self.children) == 0
+
+    def age(self) -> float:
+        """Wiek scope'a w sekundach."""
+        return time.monotonic() - self._born
+
+    # ── Inspekcja ─────────────────────────────────────────────────────────────
+
     def atom_count(self) -> int:
         return len(self._atoms)
+
+    def total_atom_count(self) -> int:
+        """Atomy w tym scope + wszystkich potomkach."""
+        total = len(self._atoms)
+        for c in self.children:
+            if isinstance(c, PhiScope):
+                total += c.total_atom_count()
+        return total
+
+    def total_scope_count(self) -> int:
+        """Liczba scope'ów w poddrzewie (włącznie z self)."""
+        total = 1
+        for c in self.children:
+            if isinstance(c, PhiScope):
+                total += c.total_scope_count()
+        return total
+
+    def max_depth(self) -> int:
+        """Najgłębsze zagnieżdżenie w poddrzewie."""
+        if not self.children:
+            return self.depth
+        return max(
+            (c.max_depth() for c in self.children if isinstance(c, PhiScope)),
+            default=self.depth
+        )
 
     def hot_atoms(self) -> List[PhiAtom]:
         return [a for a in self._atoms.values() if a.state == "HOT"]
@@ -190,17 +235,45 @@ class PhiScope(Scope):
         return [a for a in self._atoms.values() if a.state == "COLD"]
 
     def thermal_map(self) -> Dict[str, Dict[str, Any]]:
-        """Mapa temperatur zmiennych w tym scope."""
+        """Mapa temperatur zmiennych w tym scope + potomkach."""
         result = {}
+        self._collect_thermal(result, "")
+        return result
+
+    def _collect_thermal(self, out: dict, prefix: str) -> None:
         for name, atom in self._atoms.items():
-            result[name] = {
+            key = f"{prefix}{name}" if prefix else name
+            out[key] = {
                 "T":      round(atom.T, 1),
                 "state":  atom.state,
                 "reads":  atom._reads,
                 "writes": atom._writes,
                 "age":    round(atom.age(), 1),
+                "scope":  self.scope_name or "(global)",
+                "depth":  self.depth,
             }
-        return result
+        for c in self.children:
+            if isinstance(c, PhiScope):
+                child_prefix = f"{prefix}{c.scope_name}." if c.scope_name else prefix
+                c._collect_thermal(out, child_prefix)
+
+    def scope_tree(self, indent: int = 0) -> str:
+        """Tekstowa reprezentacja drzewa scope'ów."""
+        pad   = "  " * indent
+        label = self.scope_name or "(global)"
+        atoms = len(self._atoms)
+        kids  = len(self.children)
+        line  = f"{pad}[d{self.depth}] {label}  atoms={atoms} children={kids}"
+        if self._atoms:
+            names = ", ".join(sorted(self._atoms.keys())[:5])
+            if len(self._atoms) > 5:
+                names += f", ...+{len(self._atoms)-5}"
+            line += f"  ({names})"
+        lines = [line]
+        for c in self.children:
+            if isinstance(c, PhiScope):
+                lines.append(c.scope_tree(indent + 1))
+        return "\n".join(lines)
 
 
 # ─── KarmazynJSPhi ───────────────────────────────────────────────────────────
@@ -213,6 +286,9 @@ class KarmazynJSPhi(KarmazynJSCore):
     Core nie wie że istnieje PhiScope.
     PhiScope nie wie jak interpretować JS.
     Separation of concerns jest formalny.
+
+    v1.1: override _call() — scope funkcji jako PhiScope, nie Scope.
+    v1.1: _prune_dead_children() — czyszczenie pustych scope'ów w tick.
     """
 
     def __init__(self, runtime=None, context: str = "global",
@@ -220,28 +296,78 @@ class KarmazynJSPhi(KarmazynJSCore):
         super().__init__()
         # Zamień global_scope na PhiScope
         old_vars = self.global_scope.vars.copy()
-        self.global_scope = PhiScope()
+        self.global_scope = PhiScope(scope_name=name or context)
         # Przenieś builtiny do nowego scope (jako zwykłe vars, nie atoms)
         self.global_scope.vars.update(old_vars)
 
         self._runtime = runtime
-        self._context = name or context  # name = alias kompatybilności z js_web
+        self._context = name or context
         self._tick_n  = 0
         self._total_gc = 0
+        self._pruned_scopes = 0
 
-    # ── Tick — stygnięcie + GC ────────────────────────────────────────────────
+    # ── FIX Bug 1: override _call() — PhiScope zamiast Scope ─────────────────
+
+    def _call(self, fn: Any, args: List[Any],
+              this: Any = None) -> Any:
+        """
+        Override _call z Core — tworzy PhiScope zamiast Scope.
+        Dzięki temu scope'y funkcji są widoczne w drzewie phi-space,
+        ich zmienne podlegają termodynamice i GC.
+        """
+        # Rozpakowywanie spread (skopiowane z Core)
+        expanded = []
+        for a in args:
+            if isinstance(a, tuple) and len(a) == 2 and a[0] == "__spread__":
+                expanded.extend(a[1] if isinstance(a[1], list) else [a[1]])
+            else:
+                expanded.append(a)
+        args = expanded
+
+        if isinstance(fn, Function):
+            # PhiScope zamiast Scope — to jest cały fix
+            closure = fn.closure
+            if isinstance(closure, PhiScope):
+                local = PhiScope(parent=closure,
+                                 scope_name=f"fn_{fn.name}")
+            else:
+                local = PhiScope(scope_name=f"fn_{fn.name}")
+                local.parent = closure
+            for p, a in zip(fn.params, args):
+                local.set(p, a)
+            for p in fn.params[len(args):]:
+                local.set(p, None)
+            if this is not None:
+                local.vars["this"] = this  # this jako raw var, nie atom
+            try:
+                return self.exec(fn.body, local)
+            except _Return as r:
+                return r.value
+
+        if callable(fn):
+            try:
+                return fn(*args)
+            except Exception as e:
+                raise _Throw(str(e))
+
+        raise TypeError(f"'{fn!r}' is not a function")
+
+    # ── Tick — stygnięcie + GC + pruning ──────────────────────────────────────
 
     def tick(self) -> Dict[str, Any]:
         """
-        Jeden tick termodynamiczny: decay + GC w całym drzewie scope.
+        Jeden tick termodynamiczny: decay + GC + prune w całym drzewie scope.
         Wywoływany przez scheduler lub ręcznie (JS TICK).
         """
         self._tick_n += 1
         collected = self._tick_scope(self.global_scope)
-        self._total_gc += collected
+        pruned    = self._prune_dead_children(self.global_scope)
+        self._total_gc      += collected
+        self._pruned_scopes += pruned
         return {
             "tick":      self._tick_n,
             "collected": collected,
+            "pruned":    pruned,
             "total_gc":  self._total_gc,
         }
 
@@ -255,13 +381,41 @@ class KarmazynJSPhi(KarmazynJSCore):
             collected += self._tick_scope(child)
         return collected
 
+    def _prune_dead_children(self, scope) -> int:
+        """
+        FIX Bug 5: Usuwa puste scope'y-dzieci (brak atomów + brak potomków).
+        Rekurencyjne: najpierw prune wnuki, potem dzieci.
+        Scope z atomami lub żywymi potomkami przeżywa.
+        """
+        if not isinstance(scope, PhiScope):
+            return 0
+        pruned = 0
+        # Najpierw prune wnuków (bottom-up)
+        for child in list(scope.children):
+            pruned += self._prune_dead_children(child)
+        # Potem prune dzieci tego scope'a
+        alive = []
+        for child in scope.children:
+            if isinstance(child, PhiScope) and child.is_empty():
+                pruned += 1  # puste — wycinamy
+            else:
+                alive.append(child)
+        scope.children = alive
+        return pruned
+
     # ── Profiling ─────────────────────────────────────────────────────────────
 
     def thermal_map(self) -> Dict[str, Dict[str, Any]]:
-        """Pełna mapa temperatur w global scope."""
+        """Pełna mapa temperatur — global scope + potomkowie."""
         if isinstance(self.global_scope, PhiScope):
             return self.global_scope.thermal_map()
         return {}
+
+    def scope_tree(self) -> str:
+        """Drzewo scope'ów jako tekst."""
+        if isinstance(self.global_scope, PhiScope):
+            return self.global_scope.scope_tree()
+        return "(no phi-space)"
 
     def anomaly_score(self) -> float:
         """
@@ -283,39 +437,48 @@ class KarmazynJSPhi(KarmazynJSCore):
         total_writes = sum(a._writes for a in atoms)
         hot_ratio    = sum(1 for a in atoms if a.state == "HOT") / len(atoms)
 
-        # Read/write imbalance
         rw_imbalance = 0.0
         if total_writes > 0:
             rw_imbalance = max(0.0, (total_reads / total_writes - 5.0) / 10.0)
         elif total_reads > 10:
             rw_imbalance = 1.0
 
-        # All-hot anomaly (infinite loop?)
         hot_anomaly = max(0.0, hot_ratio - 0.8) * 5.0
-
-        # GC pressure
         gc_pressure = min(1.0, self._total_gc / max(1, len(atoms) * 2))
 
         return min(1.0, rw_imbalance * 0.4 + hot_anomaly * 0.4 + gc_pressure * 0.2)
 
     def phi_stats(self) -> Dict[str, Any]:
         """Statystyki phi-space kontekstu JS."""
-        atoms = list(self.global_scope._atoms.values()) if isinstance(
-            self.global_scope, PhiScope) else []
+        gs = self.global_scope
+        if isinstance(gs, PhiScope):
+            atoms = list(gs._atoms.values())
+            scope_count = gs.total_scope_count()
+            scope_depth = gs.max_depth()
+            total_atoms = gs.total_atom_count()
+        else:
+            atoms = []
+            scope_count = 1
+            scope_depth = 0
+            total_atoms = 0
         return {
-            "context":   self._context,
-            "atoms":     len(atoms),
-            "hot":       sum(1 for a in atoms if a.state == "HOT"),
-            "warm":      sum(1 for a in atoms if a.state == "WARM"),
-            "cold":      sum(1 for a in atoms if a.state == "COLD"),
-            "tomb":      sum(1 for a in atoms if a.state == "TOMB"),
-            "tick_n":    self._tick_n,
-            "total_gc":  self._total_gc,
-            "op_count":  self._op_count,
-            "max_ops":   self.MAX_OPS,
-            "anomaly":   self.anomaly_score(),
-            "reads":     sum(a._reads for a in atoms),
-            "writes":    sum(a._writes for a in atoms),
+            "context":       self._context,
+            "atoms":         len(atoms),
+            "total_atoms":   total_atoms,
+            "hot":           sum(1 for a in atoms if a.state == "HOT"),
+            "warm":          sum(1 for a in atoms if a.state == "WARM"),
+            "cold":          sum(1 for a in atoms if a.state == "COLD"),
+            "tomb":          sum(1 for a in atoms if a.state == "TOMB"),
+            "tick_n":        self._tick_n,
+            "total_gc":      self._total_gc,
+            "pruned_scopes": self._pruned_scopes,
+            "scope_count":   scope_count,
+            "scope_depth":   scope_depth,
+            "op_count":      self._op_count,
+            "max_ops":       self.MAX_OPS,
+            "anomaly":       self.anomaly_score(),
+            "reads":         sum(a._reads for a in atoms),
+            "writes":        sum(a._writes for a in atoms),
         }
 
     # ── Sandbox ───────────────────────────────────────────────────────────────
@@ -330,10 +493,6 @@ class KarmazynJSPhi(KarmazynJSCore):
     # ── Runtime integration ───────────────────────────────────────────────────
 
     def expose_atom(self, js_name: str, atom_id: str) -> bool:
-        """
-        Eksponuje atom KarmazynOS jako zmienną JS.
-        Live binding — przy każdym dostępie odczytuje atom.E z runtime.
-        """
         if self._runtime is None:
             return False
         try:
@@ -346,10 +505,6 @@ class KarmazynJSPhi(KarmazynJSCore):
             return False
 
     def expose_bubble(self, js_name: str, bubble_label: str) -> bool:
-        """
-        Eksponuje bąbel KarmazynOS jako obiekt JS.
-        Atomy bąbla stają się właściwościami obiektu.
-        """
         if self._runtime is None:
             return False
         try:
@@ -382,8 +537,9 @@ class KarmazynJSPhi(KarmazynJSCore):
 def cmd_js(args, vm: KarmazynJSPhi) -> str:
     """
     JS STATUS         — statystyki phi-space kontekstu
-    JS THERMAL        — mapa temperatur zmiennych
-    JS TICK           — ręczny tick GC
+    JS THERMAL        — mapa temperatur zmiennych (+ potomkowie)
+    JS TICK [n]       — ręczny tick GC
+    JS TREE           — drzewo scope'ów
     JS SANDBOX <name> — stwórz izolowany kontekst
     JS STATS          — szczegółowe statystyki
     """
@@ -391,11 +547,14 @@ def cmd_js(args, vm: KarmazynJSPhi) -> str:
         s = vm.phi_stats()
         lines = [
             f"Kontekst: {s['context']}",
-            f"Atomy:    {s['atoms']}  HOT:{s['hot']}  COLD:{s['cold']}",
-            f"Ticki:    {s['tick_n']}",
+            f"Atomy:    {s['atoms']} (global) / {s['total_atoms']} (drzewo)  "
+            f"HOT:{s['hot']}  COLD:{s['cold']}",
+            f"Scope'y:  {s['scope_count']}  depth={s['scope_depth']}  "
+            f"pruned={s['pruned_scopes']}",
+            f"Ticki:    {s['tick_n']}  GC:{s['total_gc']}",
             f"Operacje: {s['op_count']}/{s['max_ops']}",
             f"Anomalia: {s['anomaly']:.2f}",
-            f"Odczyty:  {s['reads']}  Zapisy: {s['writes']}",
+            f"R/W:      {s['reads']}/{s['writes']}",
         ]
         return "\n".join(lines)
 
@@ -407,21 +566,29 @@ def cmd_js(args, vm: KarmazynJSPhi) -> str:
             return "Brak atomów JS w phi-space."
         lines = ["Mapa temperatur JS:"]
         for name, info in sorted(tmap.items(), key=lambda x: -x[1]["T"]):
+            scope_tag = f"@{info['scope']}" if info.get("scope") else ""
             lines.append(
                 f"  [{info['state'][0]}] T={info['T']:5.1f}  "
                 f"R:{info['reads']:3}  W:{info['writes']:3}  "
-                f"{info['age']:5.1f}s  {name}"
+                f"d{info.get('depth',0)}  {name} {scope_tag}"
             )
         return "\n".join(lines)
 
     if sub == "TICK":
         n = int(args[1]) if len(args) > 1 else 1
         total_collected = 0
+        total_pruned    = 0
         for _ in range(n):
             result = vm.tick()
             total_collected += result["collected"]
+            total_pruned    += result["pruned"]
         return (f"Tick x{n}: zebrano {total_collected} atomów, "
+                f"przycięto {total_pruned} scope'ów, "
                 f"łącznie GC: {vm._total_gc}")
+
+    if sub == "TREE":
+        tree = vm.scope_tree()
+        return f"Drzewo scope'ów:\n{tree}"
 
     if sub == "SANDBOX":
         name = args[1] if len(args) > 1 else "sandbox"
@@ -432,15 +599,18 @@ def cmd_js(args, vm: KarmazynJSPhi) -> str:
         s = vm.phi_stats()
         lines = [
             f"=== KarmazynJS Phi Stats ===",
-            f"Kontekst:  {s['context']}",
-            f"Atomy:     {s['atoms']} (HOT:{s['hot']} WARM:{s['warm']} "
+            f"Kontekst:      {s['context']}",
+            f"Atomy global:  {s['atoms']} (HOT:{s['hot']} WARM:{s['warm']} "
             f"COLD:{s['cold']} TOMB:{s['tomb']})",
-            f"Ticki:     {s['tick_n']}",
-            f"GC total:  {s['total_gc']}",
-            f"Operacje:  {s['op_count']}/{s['max_ops']}",
-            f"Anomalia:  {s['anomaly']:.3f}",
-            f"R/W:       {s['reads']}/{s['writes']}",
+            f"Atomy drzewo:  {s['total_atoms']}",
+            f"Scope'y:       {s['scope_count']}  max depth={s['scope_depth']}",
+            f"Pruned scopes: {s['pruned_scopes']}",
+            f"Ticki:         {s['tick_n']}",
+            f"GC total:      {s['total_gc']}",
+            f"Operacje:      {s['op_count']}/{s['max_ops']}",
+            f"Anomalia:      {s['anomaly']:.3f}",
+            f"R/W:           {s['reads']}/{s['writes']}",
         ]
         return "\n".join(lines)
 
-    return f"Nieznana subkomenda JS: {args[0]}. Dostępne: STATUS THERMAL TICK SANDBOX STATS"
+    return f"Nieznana subkomenda JS: {args[0]}. Dostępne: STATUS THERMAL TICK TREE SANDBOX STATS"

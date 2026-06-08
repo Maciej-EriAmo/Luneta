@@ -150,6 +150,41 @@ class LunetaRuntime:
     def get_bubble(self, label: str) -> Optional[LunetaBubble]:
         return self._bubbles.get(label)
 
+    def create_bubble(self, label: str, atom_ids: List[str]) -> Optional[str]:
+        """
+        Tworzy NAZWANY bąbel-kontener pod etykietą `label` i wchłania członków.
+
+        Członkami mogą być atomy LUB inne bąble (zagnieżdżenie) — tabela to
+        bąbel-wierszy, wiersz to bąbel-komórek. Wcześniej create_bubble
+        filtrował tylko po has_atom, więc bąbel tabeli (członkowie = bąble
+        wierszy) nie powstawał.
+
+        Różni się od consolidate(): consolidate(atom_id) tworzy bąbel nazwany
+        ID atomu. create_bubble(label, ids) tworzy bąbel nazwany `label`
+        zawierający wielu członków (atomy i/lub zagnieżdżone bąble).
+        """
+        members = []
+        for aid in atom_ids:
+            if self.matrix.has(aid):
+                members.append(("atom", aid))
+            elif aid in self._bubbles:
+                members.append(("bubble", aid))
+        if not members:
+            return None
+        bubble = self._bubbles.get(label)
+        if bubble is None:
+            bubble = LunetaBubble(label=label)
+            self._bubbles[label] = bubble
+        for kind, aid in members:
+            if kind == "atom":
+                atom = self.matrix.get(aid)
+                if atom is not None:
+                    bubble.absorb(atom)
+            else:  # zagnieżdżony bąbel — referencja bez wchłaniania treści
+                if aid not in bubble.atom_ids:
+                    bubble.atom_ids.append(aid)
+        return label
+
     def import_to_bubble(self, bubble_label: str, atom_id: str) -> bool:
         """Importuje atom do istniejącego bąbla."""
         bubble = self._bubbles.get(bubble_label)

@@ -250,10 +250,9 @@ class KarmazynJSCore:
                 # ("prop", obj_expr, key) — obj.method(...)
                 this_obj = self.eval(fn_e[1], scope)
                 key      = fn_e[2]
-                if isinstance(this_obj, dict):
-                    fn = this_obj.get(key)
-                else:
-                    fn = getattr(this_obj, key, None)
+                # FIX: jedno źródło prawdy — metody list/str są w _get_property,
+                # nie jako atrybuty Pythona. getattr() zwracało None dla push/map/itd.
+                fn = self._get_property(this_obj, key)
                 return self._call(fn, args, this=this_obj)
 
             fn = self.eval(fn_e, scope)
@@ -267,53 +266,7 @@ class KarmazynJSCore:
             # ("prop", obj_expr, key) — obj.key
             _, obj_e, key = expr
             obj = self.eval(obj_e, scope)
-            if isinstance(obj, dict):
-                return obj.get(key)
-            if isinstance(obj, list):
-                # array properties
-                if key == "length":    return len(obj)
-                if key == "push":      return lambda *a: [obj.append(x) for x in a] or len(obj)
-                if key == "pop":       return lambda: obj.pop() if obj else None
-                if key == "shift":     return lambda: obj.pop(0) if obj else None
-                if key == "unshift":   return lambda *a: (obj.insert(0, x) for x in reversed(a)) or len(obj)
-                if key == "join":      return lambda sep="," : sep.join(str(x) for x in obj)
-                if key == "slice":     return lambda s=0,e=None: obj[s:e]
-                if key == "indexOf":   return lambda x: obj.index(x) if x in obj else -1
-                if key == "includes":  return lambda x: x in obj
-                if key == "reverse":   return lambda: obj.reverse() or obj
-                if key == "map":       return lambda fn: [self._call(fn, [x, i, obj]) for i, x in enumerate(obj)]
-                if key == "filter":    return lambda fn: [x for i, x in enumerate(obj) if self._call(fn, [x, i, obj])]
-                if key == "reduce":    return lambda fn, init=None: self._reduce(fn, obj, init)
-                if key == "forEach":   return lambda fn: [self._call(fn, [x, i, obj]) for i, x in enumerate(obj)]
-                if key == "find":      return lambda fn: next((x for i,x in enumerate(obj) if self._call(fn,[x,i,obj])), None)
-                if key == "some":      return lambda fn: any(self._call(fn,[x,i,obj]) for i,x in enumerate(obj))
-                if key == "every":     return lambda fn: all(self._call(fn,[x,i,obj]) for i,x in enumerate(obj))
-                if key == "concat":    return lambda *a: obj + [x for arr in a for x in (arr if isinstance(arr,list) else [arr])]
-                if key == "flat":      return lambda: [x for sub in obj for x in (sub if isinstance(sub,list) else [sub])]
-                if key == "sort":      return lambda fn=None: sorted(obj, key=lambda x: self._call(fn,[x,x]) if fn else x) or obj
-            if isinstance(obj, str):
-                if key == "length":    return len(obj)
-                if key == "split":     return lambda sep="": obj.split(sep) if sep else list(obj)
-                if key == "trim":      return lambda: obj.strip()
-                if key == "toUpperCase": return lambda: obj.upper()
-                if key == "toLowerCase": return lambda: obj.lower()
-                if key == "includes":  return lambda s: s in obj
-                if key == "indexOf":   return lambda s: obj.find(s)
-                if key == "slice":     return lambda s=0, e=None: obj[s:e]
-                if key == "replace":   return lambda pat, rep: obj.replace(pat, rep)
-                if key == "startsWith": return lambda s: obj.startswith(s)
-                if key == "endsWith":  return lambda s: obj.endswith(s)
-                if key == "charCodeAt": return lambda i: ord(obj[i]) if 0 <= i < len(obj) else float("nan")
-                if key == "substring": return lambda s, e=None: obj[s:e]
-                if key == "padStart":  return lambda n, c=" ": obj.rjust(n, c)
-                if key == "repeat":    return lambda n: obj * n
-            if callable(obj):
-                return obj
-            # Ogólny obiekt Python (np. LiveNode, LiveDOM) — getattr
-            try:
-                return getattr(obj, key)
-            except AttributeError:
-                return None
+            return self._get_property(obj, key)
 
         if op == "idx":
             # ("idx", obj_expr, idx_expr) — obj[key]
@@ -445,6 +398,65 @@ class KarmazynJSCore:
         return acc
 
     # ── Wywołanie funkcji ─────────────────────────────────────────────────────
+
+    def _get_property(self, obj: Any, key: str) -> Any:
+        """
+        Rozwiązuje obj.key dla wszystkich typów. Jedno źródło prawdy
+        używane przez handler 'prop' ORAZ ścieżkę wywołania metody obj.method().
+
+        FIX: wcześniej obj.method() na liście/stringu robiło getattr(obj, key)
+        — metody tablic/stringów nie są atrybutami Pythona, więc zwracało None
+        ('None' is not a function). Teraz oba miejsca używają tej metody.
+        """
+        if isinstance(obj, dict):
+            return obj.get(key)
+        if isinstance(obj, list):
+            if key == "length":    return len(obj)
+            if key == "push":      return lambda *a: [obj.append(x) for x in a] or len(obj)
+            if key == "pop":       return lambda: obj.pop() if obj else None
+            if key == "shift":     return lambda: obj.pop(0) if obj else None
+            if key == "unshift":   return lambda *a: ([obj.insert(0, x) for x in reversed(a)] or len(obj))
+            if key == "join":      return lambda sep="," : sep.join(str(x) for x in obj)
+            if key == "slice":     return lambda s=0,e=None: obj[s:e]
+            if key == "indexOf":   return lambda x: obj.index(x) if x in obj else -1
+            if key == "includes":  return lambda x: x in obj
+            if key == "reverse":   return lambda: obj.reverse() or obj
+            if key == "map":       return lambda fn: [self._call(fn, [x, i, obj]) for i, x in enumerate(obj)]
+            if key == "filter":    return lambda fn: [x for i, x in enumerate(obj) if self._call(fn, [x, i, obj])]
+            if key == "reduce":    return lambda fn, init=None: self._reduce(fn, obj, init)
+            if key == "forEach":   return lambda fn: [self._call(fn, [x, i, obj]) for i, x in enumerate(obj)]
+            if key == "find":      return lambda fn: next((x for i,x in enumerate(obj) if self._call(fn,[x,i,obj])), None)
+            if key == "some":      return lambda fn: any(self._call(fn,[x,i,obj]) for i,x in enumerate(obj))
+            if key == "every":     return lambda fn: all(self._call(fn,[x,i,obj]) for i,x in enumerate(obj))
+            if key == "concat":    return lambda *a: obj + [x for arr in a for x in (arr if isinstance(arr,list) else [arr])]
+            if key == "flat":      return lambda: [x for sub in obj for x in (sub if isinstance(sub,list) else [sub])]
+            if key == "sort":      return lambda fn=None: sorted(obj, key=lambda x: self._call(fn,[x,x]) if fn else x) or obj
+            return None
+        if isinstance(obj, str):
+            if key == "length":    return len(obj)
+            if key == "split":     return lambda sep="": obj.split(sep) if sep else list(obj)
+            if key == "trim":      return lambda: obj.strip()
+            if key == "toUpperCase": return lambda: obj.upper()
+            if key == "toLowerCase": return lambda: obj.lower()
+            if key == "includes":  return lambda s: s in obj
+            if key == "indexOf":   return lambda s: obj.find(s)
+            if key == "slice":     return lambda s=0, e=None: obj[s:e]
+            if key == "replace":   return lambda pat, rep: obj.replace(pat, rep)
+            if key == "startsWith": return lambda s: obj.startswith(s)
+            if key == "endsWith":  return lambda s: obj.endswith(s)
+            if key == "charCodeAt": return lambda i: ord(obj[i]) if 0 <= i < len(obj) else float("nan")
+            if key == "substring": return lambda s, e=None: obj[s:e]
+            if key == "padStart":  return lambda n, c=" ": obj.rjust(n, c)
+            if key == "repeat":    return lambda n: obj * n
+            return None
+        if callable(obj):
+            # Funkcja/lambda — property na funkcji (rzadkie); zwróć ją samą
+            return obj
+        # Ogólny obiekt Python (np. LiveNode, LiveDOM) — getattr
+        try:
+            return getattr(obj, key)
+        except AttributeError:
+            return None
 
     def _call(self, fn: Any, args: List[Any],
                this: Any = None) -> Any:

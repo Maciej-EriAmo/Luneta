@@ -83,6 +83,17 @@ except ImportError:
     HAS_BROWSER = False
     # Duck typing — mapper działa z dowolnym obiektem mającym .semantic_tree
 
+# Narzędzia tekstowe — poprawna ocena czytelności + wykrywanie błędu dekodowania
+try:
+    from luneta_text import is_readable_text, looks_like_decode_error
+    HAS_TEXT_UTILS = True
+except ImportError:
+    HAS_TEXT_UTILS = False
+    def is_readable_text(text, max_bad_ratio=0.15):
+        return bool(text and text.strip())
+    def looks_like_decode_error(text):
+        return False
+
 __all__ = ['DOMMapper', 'cmd_dom']
 
 # ─── Temperatura semantyczna ─────────────────────────────────────────────────
@@ -204,6 +215,14 @@ class DOMMapper:
         url = page.url
         tree = getattr(page, "semantic_tree", None)
         if tree is None:
+            return None
+
+        # Strona-błąd dekodowania (np. brotli bez biblioteki) — nie mapuj
+        # komunikatu błędu jako treści. Sygnalizuje to browser przez flagę
+        # decode_failed albo treść wygląda jak komunikat.
+        if getattr(page, "decode_failed", False):
+            return None
+        if looks_like_decode_error(getattr(page, "title", "") or ""):
             return None
 
         # Idempotencja — nie mapuj ponownie świeżej strony
@@ -536,14 +555,30 @@ class DOMMapper:
         """
         Tworzy lub aktualizuje atom w phi-space.
         Idempotentne: jeśli atom istnieje, aktualizuje T.
+
+        Bramka czytelności: odrzuca TYLKO prawdziwy śmieć (znaki kontrolne,
+        replacement chars z błędu dekodowania). Akceptuje krótkie słowa,
+        polskie diakrytyki, symbole i cyfry ('Premium', 'Gdańsk', '21°C').
+        Dla linków sprawdza tekst (w S='link:...'), nie URL (w E).
         """
+        # Tekst do oceny: dla linku to etykieta z S, dla reszty to E
+        check = E
+        if isinstance(S, str) and S.startswith("link:"):
+            check = S[5:]
+        if check and not is_readable_text(check):
+            return None    # cicho — bez spamu; tylko realny śmieć tu wpada
         try:
             if self.runtime.matrix.has_atom(label):
                 atom = self.runtime.get_atom(label)
                 if atom:
-                    # DOM diff przez T: aktualizacja = przegrzanie
-                    atom.T     = T
-                    atom.state = _state_for_T(T)
+                    # DOM diff przez T: aktualizacja przez unified model API
+                    # (heat/cool synchronizuje state; bezpośrednie atom.T=...
+                    #  omijało _update_state i mogło rozjechać state z T)
+                    delta = T - atom.T
+                    if delta > 0:
+                        atom.heat(delta)
+                    elif delta < 0:
+                        atom.cool(-delta)
                 return label
             else:
                 self.runtime.create_atom(label, S, E, T)
@@ -554,21 +589,37 @@ class DOMMapper:
     def _make_bubble(self, label: str, atom_ids: List[str]) -> bool:
         """Konsoliduje atomy do bąbla."""
         try:
-            if self.runtime.get_bubble(label) is None:
-                # Konsoliduj pierwszy atom jako kotew bąbla
-                if atom_ids and self.runtime.matrix.has_atom(atom_ids[0]):
-                    self.runtime.consolidate(atom_ids[0])
-            bubble = self.runtime.get_bubble(label)
-            if bubble is None:
+            # Członek = atom LUB istniejący bąbel (tabela = bąbel-wierszy)
+            valid = [aid for aid in atom_ids
+                     if self.runtime.matrix.has_atom(aid)
+                     or self.runtime.get_bubble(aid) is not None]
+            if not valid:
                 return False
-            # Importuj pozostałe atomy do bąbla
-            for aid in atom_ids[1:]:
-                if self.runtime.matrix.has_atom(aid):
+            # FIX: bąbel-kontener pod etykietą `label` (nie pod id pierwszego
+            # atomu). Wcześniej consolidate(atom_ids[0]) tworzył bąbel nazwany
+            # 'dom_li13', a get_bubble('dom_lst12') zwracał None → "failed".
+            if self.runtime.get_bubble(label) is None:
+                if hasattr(self.runtime, "create_bubble"):
+                    self.runtime.create_bubble(label, valid)
+                else:
+                    # Fallback dla starszego runtime: konsoliduj pierwszy atom,
+                    # potem importuj resztę (bąbel pod id pierwszego atomu).
+                    anchor = valid[0]
+                    self.runtime.consolidate(anchor)
+                    label = anchor
+                    for aid in valid[1:]:
+                        try:
+                            self.runtime.import_to_bubble(label, aid)
+                        except Exception:
+                            pass
+                    return True
+            else:
+                for aid in valid:
                     try:
                         self.runtime.import_to_bubble(label, aid)
                     except Exception:
                         pass
-            return True
+            return self.runtime.get_bubble(label) is not None
         except Exception:
             return False
 
@@ -718,10 +769,17 @@ def _split_sentences(text: str) -> List[str]:
 
 
 def _state_for_T(T: float) -> str:
-    if T >= 70: return "HOT"
-    if T >= 30: return "WARM"
-    if T >= 10: return "COLD"
-    return "TOMB"
+    # Jedno źródło prawdy w karmazyn_atom (próg COLD = T_TOMB = 2.0).
+    # Wcześniej lokalny próg 10 rozjeżdżał klasyfikację z resztą systemu:
+    # atom T=5 był tu "TOMB", a w karmazyn_atom "COLD".
+    try:
+        from karmazyn_atom import state_for_T
+        return state_for_T(T)
+    except ImportError:
+        if T >= 70: return "HOT"
+        if T >= 30: return "WARM"
+        if T >= 2.0: return "COLD"
+        return "TOMB"
 
 
 # ─── Integracja z karmazyn_browser ───────────────────────────────────────────

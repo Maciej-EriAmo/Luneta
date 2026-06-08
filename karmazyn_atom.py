@@ -202,11 +202,13 @@ class AtomRegistry:
 
     def __init__(self):
         self._atoms: Dict[str, Atom] = {}
+        self._generation: int = 0
 
     def create(self, id: str, S: str = "", E: str = "",
                T: float = T_INIT, **kwargs) -> Atom:
         a = Atom(id, S, E, T, **kwargs)
         self._atoms[id] = a
+        self._generation += 1
         return a
 
     def get(self, id: str) -> Optional[Atom]:
@@ -218,6 +220,7 @@ class AtomRegistry:
     def delete(self, id: str) -> bool:
         if id in self._atoms:
             del self._atoms[id]
+            self._generation += 1
             return True
         return False
 
@@ -244,9 +247,13 @@ class AtomRegistry:
 
     def gc(self, dead_ids: List[str]) -> int:
         """Usuń martwe atomy. Zwraca liczbę usuniętych."""
+        removed = 0
         for id in dead_ids:
-            self._atoms.pop(id, None)
-        return len(dead_ids)
+            if self._atoms.pop(id, None) is not None:
+                removed += 1
+        if removed > 0:
+            self._generation += 1
+        return removed
 
     def hot_atoms(self) -> List[Atom]:
         return [a for a in self._atoms.values() if a.is_hot]
@@ -285,19 +292,22 @@ class AtomsWrapper:
     różnych konwencji dostępu do listy atomów.
 
     Używany przez PhiBuffer, draw_phi_map, zewnętrzne narzędzia.
+
+    FIX v1.1: cache invalidacja przez generation counter zamiast len().
+    len() nie wykrywa replace (delete+create przy tym samym rozmiarze).
     """
 
     def __init__(self, registry: "AtomRegistry"):
         self._reg   = registry
         self._cache: Optional[List["Atom"]] = None
-        self._cache_size = -1
+        self._cache_gen = -1
 
     def _get_list(self) -> List["Atom"]:
-        """Zwraca listę atomów — z cache jeśli rozmiar się nie zmienił."""
-        current_size = len(self._reg._atoms)
-        if self._cache is None or self._cache_size != current_size:
-            self._cache      = list(self._reg._atoms.values())
-            self._cache_size = current_size
+        """Zwraca listę atomów — z cache jeśli generacja się nie zmieniła."""
+        current_gen = self._reg._generation
+        if self._cache is None or self._cache_gen != current_gen:
+            self._cache     = list(self._reg._atoms.values())
+            self._cache_gen = current_gen
         return self._cache
 
     def __call__(self) -> List["Atom"]:

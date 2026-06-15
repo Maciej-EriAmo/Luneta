@@ -34,6 +34,7 @@ from karmazyn_atom import (
     T_INIT, T_MAX, T_HOT, T_WARM, T_TOMB,
     DECAY_DEFAULT,
 )
+from karmazyn_substrate import Store as KarmazynEngine
 
 
 # ─── Bubble — lekka wersja ───────────────────────────────────────────────────
@@ -90,9 +91,17 @@ class LunetaRuntime:
     """
 
     def __init__(self):
-        self.matrix    = AtomRegistry()
         self._bubbles:  Dict[str, LunetaBubble] = {}
         self._holograms: Dict[str, Dict[str, Any]] = {}
+        # Silnik: kanoniczny substrat z reach-GC, nie goły AtomRegistry.
+        # Osiągalność Lunety = atomy trzymane przez bąble-kontenery (płaskie
+        # członkostwo). Atom w bąblu przeżywa stygnięcie; sierota ginie.
+        self.engine = KarmazynEngine(
+            thermal=True,
+            extra_reach=lambda: {aid for b in self._bubbles.values() for aid in b.atom_ids},
+        )
+        # alias: konsumenci (browser/dom/js_web) wołają matrix.has_atom/atoms/get/stats
+        self.matrix = self.engine.reg
 
     # ── Atomy ─────────────────────────────────────────────────────────────────
 
@@ -119,6 +128,10 @@ class LunetaRuntime:
         atom = self.matrix.get(id)
         if atom:
             atom.kill()
+            self.matrix.delete(id)               # usuń z rejestru — nie czekaj na GC
+            for b in self._bubbles.values():      # i z bąbli, które go trzymały
+                if id in b.atom_ids:
+                    b.atom_ids.remove(id)
         return atom
 
     def list_atoms(self, layer: str = None,
@@ -227,13 +240,14 @@ class LunetaRuntime:
     # ── Termodynamika ─────────────────────────────────────────────────────────
 
     def step(self, n: int = 1) -> Dict[str, Any]:
-        """Tick termodynamiczny — decay + GC."""
+        """Tick termodynamiczny — decay + BEZPIECZNY reach-GC (silnik substratu).
+
+        Atom trzymany przez bąbel jest osiągalny → przeżywa stygnięcie (archiwum).
+        Tylko atom-sierota (w żadnym bąblu) ginie, gdy ostygnie. Naprawia bug,
+        w którym GC po samej temperaturze kasował treść strony spod bąbla.
+        """
         for _ in range(n):
-            dead = self.matrix.tick()
-            self.matrix.gc(dead)
-            # Wyczyść bąble martwych atomów
-            for did in dead:
-                self._bubbles.pop(did, None)
+            self.engine.tick()
         return self.status_summary()
 
     def status_summary(self) -> Dict[str, int]:

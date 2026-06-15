@@ -1,22 +1,28 @@
 """
-karmazyn_js_web.py — JS Web Bridge dla Lunety v1.1
-====================================================
+karmazyn_js_web.py — JS Web Bridge dla Lunety v1.3 (Diagnostyka)
+================================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
 Most między silnikiem JS a przeglądarką Luneta.
 
-Zmiany v1.1:
-  - Aktywny parser JS (karmazyn_js_parser). Skrypty są poprawnie ewaluowane.
-  - Budowanie LiveDOM za pomocą natywnego appendChild() (ochrona relacji węzłów).
-  - Prawidłowe parsowanie ręcznych wyrażeń w cmd_js_bridge (JS RUN).
+Zmiany v1.3:
+  - DIAGNOSTYKA: Wstrzyknięcie globalnego API `console` (log, warn, error).
+  - DIAGNOSTYKA: Agregacja błędów parsowania i wykonania w `_js_errors`.
+  - CLI: Dodano komendy `JS LOGS` i `JS ERRORS` do wglądu w zrzuty i awarie.
+
+Zmiany v1.2:
+  - USUNIĘTO destruktywny cache plików JS w atomach.
+  - Skrypty zewnętrzne używają `http_get`.
 """
 
 import re
+import urllib.parse
 from typing import Any, Dict, List, Optional, Tuple
 
 from karmazyn_js_phi import KarmazynJSPhi, cmd_js
 from karmazyn_live_dom import LiveDOM, LiveNode, bind_live_dom
 from karmazyn_live_dom import NODE_TEXT
+from karmazyn_browser import http_get
 
 try:
     from karmazyn_browser import NodeType, SemanticNode, TextChunk
@@ -24,43 +30,31 @@ try:
 except ImportError:
     HAS_BROWSER = False
 
-
 # ─── Konwersja SemanticNode → LiveDOM ────────────────────────────────────────
 
-def semantic_to_live(node: Any, doc: LiveDOM,
-                     depth: int = 0,
-                     max_depth: int = 50) -> Optional[LiveNode]:
-    """
-    Konwertuje SemanticNode (ze sparsowanego HTML) na LiveNode.
-    Buduje żywe drzewo DOM, używając natywnego appendChild.
-    """
+def semantic_to_live(node: Any, doc: LiveDOM, depth: int = 0, max_depth: int = 50) -> Optional[LiveNode]:
     if node is None or depth > max_depth:
         return None
 
     typ = getattr(node, "typ", -1)
     tag = getattr(node, "tag", "")
 
-    # Węzeł tekstowy
     if typ == NODE_TEXT or typ == 8:
         text = getattr(node, "text", "")
         if not text or not text.strip():
             return None
         return doc.createTextNode(text)
 
-    # Węzeł DOCUMENT — specjalny przypadek, zwróć body
     if typ == 0 or tag == "document":
         for child in getattr(node, "children", []):
             _populate_body(child, doc, depth + 1, max_depth)
         return doc.body
 
-    # Element normalny
     live = doc.createElement(tag or "div")
 
-    # Kopiuj atrybuty
     for k, v in getattr(node, "attrs", {}).items():
         live.setAttribute(k, str(v))
 
-    # Rekurencja po dzieciach
     for child in getattr(node, "children", []):
         live_child = semantic_to_live(child, doc, depth + 1, max_depth)
         if live_child is not None:
@@ -69,9 +63,7 @@ def semantic_to_live(node: Any, doc: LiveDOM,
     return live
 
 
-def _populate_body(node: Any, doc: LiveDOM,
-                   depth: int, max_depth: int) -> None:
-    """Wypełnia doc.body węzłami z drzewa SemanticNode."""
+def _populate_body(node: Any, doc: LiveDOM, depth: int, max_depth: int) -> None:
     tag = getattr(node, "tag", "")
     if tag in ("html", "body", "document"):
         for child in getattr(node, "children", []):
@@ -82,12 +74,7 @@ def _populate_body(node: Any, doc: LiveDOM,
         doc.body.appendChild(live)
 
 
-def build_live_dom(page: Any, runtime: Any,
-                   vm: KarmazynJSPhi) -> LiveDOM:
-    """
-    Buduje LiveDOM ze strony Lunety (ParsedPage).
-    Punkt wejścia dla JSBridge.
-    """
+def build_live_dom(page: Any, runtime: Any, vm: KarmazynJSPhi) -> LiveDOM:
     doc = bind_live_dom(vm, runtime, prefix=_url_prefix(page.url))
     doc.title = page.title
 
@@ -101,11 +88,6 @@ def build_live_dom(page: Any, runtime: Any,
 # ─── Ekstrakcja skryptów ──────────────────────────────────────────────────────
 
 def extract_scripts(html: str) -> List[Tuple[str, str]]:
-    """
-    Wyciąga skrypty z HTML.
-    Zwraca [(typ, kod), ...] gdzie typ = "inline" | "external".
-    Skrypty zewnętrzne (src=) zwracają (external, url).
-    """
     scripts = []
     pattern = re.compile(
         r'<script([^>]*)>(.*?)</script>',
@@ -118,11 +100,10 @@ def extract_scripts(html: str) -> List[Tuple[str, str]]:
         attrs_raw = m.group(1)
         code      = m.group(2).strip()
 
-        # Pomiń type="module", type="text/template" itp.
         type_m = type_pattern.search(attrs_raw)
         if type_m:
             t = type_m.group(1).lower()
-            if t not in ("text/javascript", "application/javascript", ""):
+            if t not in ("text/javascript", "application/javascript", "module", "application/ecmascript", ""):
                 continue
 
         src_m = src_pattern.search(attrs_raw)
@@ -137,12 +118,6 @@ def extract_scripts(html: str) -> List[Tuple[str, str]]:
 # ─── JSBridge — główna klasa ──────────────────────────────────────────────────
 
 class JSBridge:
-    """
-    Most JS dla Lunety.
-    Tworzy izolowany KarmazynJSPhi dla każdej strony.
-    Każda strona dostaje własny phi-space — sandbox strukturalny.
-    """
-
     def __init__(self, runtime):
         self.runtime = runtime
         self._vm:   Optional[KarmazynJSPhi] = None
@@ -151,14 +126,15 @@ class JSBridge:
         self._scripts_run   = 0
         self._mutations     = 0
         self._active        = False
-
-    # ── Attach / detach ───────────────────────────────────────────────────────
+        
+        # Narzędzia diagnostyczne
+        self._console_logs: List[str] = []
+        self._js_errors:    List[str] = []
 
     def attach(self, page: Any) -> None:
-        """
-        Dołącza do nowej strony.
-        Tworzy izolowany VM i buduje LiveDOM.
-        """
+        self._console_logs.clear()
+        self._js_errors.clear()
+        
         self._vm = KarmazynJSPhi(
             runtime=self.runtime,
             name=_url_prefix(getattr(page, "url", "page")),
@@ -166,23 +142,17 @@ class JSBridge:
         self._inject_browser_api(page)
         self._doc = build_live_dom(page, self.runtime, self._vm)
         self._doc.on_mutate(lambda: self._on_mutation())
-        self._page_url   = getattr(page, "url", "")
+        self._page_url    = getattr(page, "url", "")
         self._scripts_run = 0
         self._mutations   = 0
         self._active      = True
 
     def detach(self) -> None:
-        """Odłącza od strony — VM i LiveDOM są zwalniane."""
         self._vm     = None
         self._doc    = None
         self._active = False
 
-    # ── Uruchamianie skryptów ─────────────────────────────────────────────────
-
     def run_scripts(self, page: Any) -> Dict[str, Any]:
-        """
-        Wyciąga i uruchamia skrypty ze strony.
-        """
         if not self._active or self._vm is None:
             return {"ok": False, "reason": "bridge not attached"}
 
@@ -214,42 +184,26 @@ class JSBridge:
         return results
 
     def _run_external(self, url: str) -> Tuple[bool, str]:
-        """
-        Pobiera i uruchamia zewnętrzny skrypt JS.
-        Wynik jest poddawany ocenie termodynamicznej.
-        """
-        cache_id = f"js_script:{url}"
-        if self._vm and hasattr(self._vm, "_runtime") and self._vm._runtime:
-            cached = self._vm._runtime.peek_atom(cache_id)
-            if cached and not cached.is_dead():
-                cached.touch()
-                return self._run_inline(cached.E)
+        full_url = urllib.parse.urljoin(self._page_url, url)
 
-        code = None
         try:
-            import urllib.request
-            with urllib.request.urlopen(url, timeout=5) as resp:
-                code = resp.read().decode("utf-8", errors="replace")
+            resp = http_get(full_url)
+            if not resp or not resp.ok():
+                err_msg = f"fetch failed: status {resp.status if resp else 0} dla {full_url}"
+                self._js_errors.append(err_msg)
+                return False, err_msg
+            code = resp.text
         except Exception as e:
-            return False, f"fetch failed: {e}"
+            err_msg = f"fetch error ({full_url}): {e}"
+            self._js_errors.append(err_msg)
+            return False, err_msg
 
         if not code or not code.strip():
             return False, "empty response"
 
-        if self._vm and hasattr(self._vm, "_runtime") and self._vm._runtime:
-            try:
-                self._vm._runtime.create_atom(
-                    cache_id, S="js:external", E=code[:8192], T=50.0)
-            except Exception:
-                pass
+        return self._run_inline(code, source_name=full_url)
 
-        return self._run_inline(code)
-
-    def _run_inline(self, source: str) -> Tuple[bool, str]:
-        """
-        Główne wywołanie parsera AST. 
-        Uruchamia kod w phi-space i aktywuje LiveDOM.
-        """
+    def _run_inline(self, source: str, source_name: str = "inline_script") -> Tuple[bool, str]:
         try:
             from karmazyn_js_parser import parse_js
             prog = parse_js(source)
@@ -260,13 +214,11 @@ class JSBridge:
                 self._doc.flush()
             return True, ""
         except Exception as e:
-            return False, str(e)[:120]
+            err_msg = f"[{source_name}] Error: {str(e)[:300]}"
+            self._js_errors.append(err_msg)
+            return False, err_msg
 
     def run_ast(self, program: list) -> Tuple[bool, Any]:
-        """
-        Uruchamia program (AST) na LiveDOM aktualnej strony.
-        Używane przez BROWSE JS dla ręcznego testowania.
-        """
         if not self._active or self._vm is None:
             return False, "bridge not attached"
         try:
@@ -275,14 +227,11 @@ class JSBridge:
                 self._doc.flush()
             return True, result
         except Exception as e:
+            err_msg = f"[AST Run] Error: {str(e)}"
+            self._js_errors.append(err_msg)
             return False, str(e)
 
-    # ── Renderowanie po mutacjach ─────────────────────────────────────────────
-
     def live_chunks(self) -> List[Any]:
-        """
-        Konwertuje LiveDOM → TextChunki dla Lunety po operacjach JS.
-        """
         if not self._active or self._doc is None:
             return []
         return _live_to_chunks(self._doc.body)
@@ -293,14 +242,10 @@ class JSBridge:
     def reset_mutations(self) -> None:
         self._mutations = 0
 
-    # ── Tick schedulera ───────────────────────────────────────────────────────
-
     def tick(self) -> Dict[str, Any]:
         if self._vm is None:
             return {}
         return self._vm.tick()
-
-    # ── Phi-space stats ───────────────────────────────────────────────────────
 
     def status(self) -> Dict[str, Any]:
         if not self._active or self._vm is None:
@@ -311,13 +256,29 @@ class JSBridge:
         s["scripts_run"]  = self._scripts_run
         s["dom_nodes"]    = self._count_nodes(self._doc.body) if self._doc else 0
         s["url"]          = self._page_url
+        s["log_count"]    = len(self._console_logs)
+        s["err_count"]    = len(self._js_errors)
         return s
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _inject_browser_api(self, page: Any) -> None:
         url  = getattr(page, "url", "")
         vm   = self._vm
+
+        def make_logger(level: str):
+            def logger(*args):
+                msg = " ".join(str(a) for a in args)
+                # Ograniczamy rozrost logów na ekstremalnie głośnych stronach
+                if len(self._console_logs) < 1000:
+                    self._console_logs.append(f"[{level}] {msg}")
+            return logger
+
+        vm.set_global("console", {
+            "log":   make_logger("LOG"),
+            "error": make_logger("ERR"),
+            "warn":  make_logger("WARN"),
+            "info":  make_logger("INFO"),
+            "debug": make_logger("DEBUG"),
+        })
 
         vm.set_global("navigator", {
             "userAgent":  "KarmazynBrowser/4.4 KarmazynOS",
@@ -359,8 +320,6 @@ class JSBridge:
             return 0
         return 1 + sum(self._count_nodes(c) for c in node.children)
 
-
-# ─── LiveDOM → TextChunki ─────────────────────────────────────────────────────
 
 def _live_to_chunks(node: LiveNode) -> List[Any]:
     chunks = []
@@ -421,8 +380,6 @@ def _node_to_chunks(node: LiveNode, out: list, depth: int = 0) -> None:
         out.append(TextChunk(text="\n"))
 
 
-# ─── URL helpers ─────────────────────────────────────────────────────────────
-
 def _url_prefix(url: str) -> str:
     import re
     return re.sub(r"[^a-z0-9]", "_",
@@ -451,35 +408,36 @@ def _url_hostname(url: str) -> str:
         return ""
 
 
-# ─── Komenda shella ───────────────────────────────────────────────────────────
-
 def cmd_js_bridge(args: list, bridge: JSBridge) -> str:
-    """
-    Dostępne przez BROWSE JS lub JS w shellu:
-
-    JS STATUS            — statystyki phi-space VM
-    JS THERMAL           — mapa temperatur zmiennych JS
-    JS TICK              — ręczny tick GC
-    JS DOM               — struktura LiveDOM (render tekst)
-    JS RUN <expr>        — wykonaj wyrażenie
-    """
     if not bridge._active:
         return "JS Bridge nieaktywny. Najpierw otwórz stronę: LUNETA <url>"
 
     if not args or args[0].upper() == "STATUS":
         s = bridge.status()
         lines = [
-            f"Aktywny:    {s['active']}",
-            f"URL:        {s.get('url','?')[:50]}",
-            f"Węzły DOM:  {s.get('dom_nodes',0)}",
-            f"Mutacje:    {s.get('mutations',0)}",
-            f"Skrypty:    {s.get('scripts_run',0)}",
-            f"Atomy JS:   {s.get('atoms',0)}  HOT:{s.get('hot',0)}",
-            f"Operacje:   {s.get('op_count',0)}/{s.get('max_ops',0)}",
+            f"Aktywny:     {s['active']}",
+            f"URL:         {s.get('url','?')[:50]}",
+            f"Węzły DOM:   {s.get('dom_nodes',0)}",
+            f"Mutacje:     {s.get('mutations',0)}",
+            f"Skrypty:     {s.get('scripts_run',0)}",
+            f"Logi/Błędy:  {s.get('log_count',0)} logów / {s.get('err_count',0)} awarii",
+            f"Atomy JS:    {s.get('atoms',0)}  HOT:{s.get('hot',0)}",
+            f"Operacje:    {s.get('op_count',0)}/{s.get('max_ops',0)}",
         ]
         return "\n".join(lines)
 
     sub = args[0].upper()
+
+    if sub == "LOGS":
+        if not bridge._console_logs:
+            return "Pusty log konsoli JS."
+        # Wypisujemy ostatnie 40 wpisów, by nie zalać terminala
+        return "Logi konsoli JS (ostatnie 40):\n" + "\n".join(f"  {l}" for l in bridge._console_logs[-40:])
+
+    if sub == "ERRORS":
+        if not bridge._js_errors:
+            return "Brak awarii JS w bieżącej sesji."
+        return "Błędy parsowania/wykonania JS (ostatnie 40):\n" + "\n".join(f"  - {e}" for e in bridge._js_errors[-40:])
 
     if sub == "THERMAL" and bridge._vm:
         return cmd_js(["THERMAL"], bridge._vm)
@@ -501,4 +459,4 @@ def cmd_js_bridge(args: list, bridge: JSBridge) -> str:
         except Exception as e:
             return f"Błąd parsowania wyrażenia: {e}"
 
-    return cmd_js_bridge([], bridge)
+    return cmd_js_bridge(["STATUS"], bridge)

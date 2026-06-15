@@ -108,9 +108,17 @@ class LiveNode:
     def id(self) -> str:
         return self.attrs.get("id", "")
 
+    @id.setter
+    def id(self, value: str) -> None:
+        self.setAttribute("id", value)
+
     @property
     def className(self) -> str:
         return self.attrs.get("class", "")
+
+    @className.setter
+    def className(self, value: str) -> None:
+        self.setAttribute("class", value)
 
     @property
     def tagName(self) -> str:
@@ -123,6 +131,18 @@ class LiveNode:
     @property
     def style(self) -> "_StyleProxy":
         return _StyleProxy(self)
+
+    @property
+    def childNodes(self) -> List["LiveNode"]:
+        return self.children
+
+    @property
+    def firstChild(self) -> Optional["LiveNode"]:
+        return self.children[0] if self.children else None
+
+    @property
+    def lastChild(self) -> Optional["LiveNode"]:
+        return self.children[-1] if self.children else None
 
     def _to_html(self) -> str:
         if self.typ == NODE_TEXT:

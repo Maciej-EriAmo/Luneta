@@ -34,44 +34,44 @@ except ImportError:
 
 def show_help():
     help_text = """
-=== LUNETA — Przeglądarka KarmazynOS ===
+=== LUNETA — Przeglądarka phi-space v1.2 (System CLI) ===
 
 NAWIGACJA:
   <url>               — Otwórz stronę (np. wp.pl, https://example.com)
-  links | ln | l      — Wyświetl listę linków na bieżącej stronie
-  <numer>             — Podążaj za linkiem o danym numerze (np. 5)
-  f <numer>           — Alternatywa dla podążania za linkiem (follow 5)
-  b | back            — Wstecz (poprzednia strona)
-  r | reload          — Przeładuj bieżącą stronę
+  back | b | h        — Wstecz
+  fwd | forward       — Do przodu
+  reload | r          — Odśwież stronę
+  links | l           — Wyświetl listę linków
+  follow | f <num>    — Podążaj za linkiem o danym numerze
+  history             — Historia sesji
 
-WIDOK:
-  j <n> | scroll <n>  — Przewiń w dół o <n> linii (domyślnie 1, np. j 10)
-  k                   — Przewiń o 1 linię w górę
+KONTROLA I WYŚWIETLANIE:
+  scroll <n> | j      — Przewiń o n ekranów (j = scroll 1)
+  k                   — Przewiń o 1 ekran w górę
+  pager <liczba|OFF>  — Ustaw paginację (OFF dla płynnego kółka myszy)
+  find <tekst>        — Znajdź tekst na bieżącej stronie
 
-WARSTWA PHI-SPACE (DOM Mapper):
-  dom                 — Statystyki phi-space aktualnej strony
-  dom map             — (Re)mapuj aktualną stronę do bąbli i atomów
-  dom outline         — Szkielet strony (nagłówki jako atomy wg T)
-  dom reader [T]      — Wyświetl atomy powyżej progu temperatury T (domyślnie 60)
-  dom find <query>    — Szukaj słowa w atomach aktualnej strony
-  dom phi <query>     — Szukaj słowa we wszystkich odwiedzonych stronach
+DOM I SEMANTYKA (Phi-Space):
+  dom map             — (Prze)indeksuj bieżącą stronę do phi-space
+  dom outline         — Pokaż szkielet nagłówków (T-mapa)
+  dom reader <T>      — Tryb czytnika (filtruje atomy < T temperatury)
 
-WARSTWA JAVASCRIPT:
-  js status           — Statystyki phi-space silnika JS
-  js thermal          — Mapa temperatur zmiennych w środowisku JS
+DIAGNOSTYKA JS (Bridge v1.3):
+  js status           — Stan maszyny VM, mutacje DOM, błędy
+  js logs             — Zrzut logów konsoli (console.log/error)
+  js errors           — Zrzut błędów parsowania i wyjątków JS
+  js run <expr>       — Wykonaj wyrażenie w bieżącym kontekście VM
 
-SILNIK ASYNC (ThermalLoop):
-  js loop             — Statystyki pętli termodynamicznej (timery, promisy)
-  js pump [n]         — Przesuń pętlę o n obrotów (domyślnie 1)
-  js run [max]        — Napędź pętlę aż do bezczynności (cap max ticków)
-  js errors           — Ostatnie błędy async
-
-SYSTEM:
-  help | h | ?        — Wyświetl tę pomoc
-  exit | quit | q     — Zamknij środowisko
+PAMIĘĆ I ZAKŁADKI:
+  bm                  — Dodaj zakładkę
+  bookmarks           — Lista zakładek
+  goto <num>          — Skocz do zakładki
+  recall <zapytanie>  — Przywołaj rezonujące fragmenty z pamięci
+  common              — Znajdź części wspólne między stronami
+  save <label>        — Zapisz stronę jako stały atom
 """
     print(help_text)
-
+    
 def main():
     print("Inicjalizacja rdzenia...")
     runtime = LunetaRuntime()

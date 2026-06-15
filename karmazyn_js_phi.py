@@ -333,12 +333,9 @@ class KarmazynJSPhi(KarmazynJSCore):
             else:
                 local = PhiScope(scope_name=f"fn_{fn.name}")
                 local.parent = closure
-            for p, a in zip(fn.params, args):
-                local.set(p, a)
-            for p in fn.params[len(args):]:
-                local.set(p, None)
             if this is not None:
                 local.vars["this"] = this  # this jako raw var, nie atom
+            self._bind_params(local, fn.params, args)   # współdzielone z Core — koniec duplikacji
             try:
                 return self.exec(fn.body, local)
             except _Return as r:

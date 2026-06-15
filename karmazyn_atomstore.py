@@ -54,6 +54,7 @@ def capabilities(store: Any) -> dict:
     """
     return {
         "semantic":  callable(getattr(store, "find_resonating", None)),
+        "tinted":    callable(getattr(store, "resonate", None)),
         "hrr":       callable(getattr(store, "enable_hrr", None)),
         "hologram":  callable(getattr(store, "archive_to_hologram", None)),
         "consolidate": callable(getattr(store, "consolidate", None)),

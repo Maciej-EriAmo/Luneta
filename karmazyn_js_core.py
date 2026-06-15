@@ -119,6 +119,8 @@ _OPS = {
     "**":  lambda a, b: a ** b,
     "==":  lambda a, b: a == b,
     "!=":  lambda a, b: a != b,
+    "===": lambda a, b: a == b,   # silnik nie robi koercji, więc === == ==
+    "!==": lambda a, b: a != b,
     "<":   lambda a, b: a < b,
     ">":   lambda a, b: a > b,
     "<=":  lambda a, b: a <= b,
@@ -319,8 +321,13 @@ class KarmazynJSCore:
 
         if op == "obj":
             result = {}
-            for k, v_e in expr[1].items():
-                result[k] = self.eval(v_e, scope)
+            entries = expr[1]
+            if isinstance(entries, dict):           # stary kształt: {klucz: wyrażenie}
+                for k, v_e in entries.items():
+                    result[k] = self.eval(v_e, scope)
+            else:                                   # nowy kształt: [(kind, klucz, wartość), ...]
+                for entry in entries:               # kind: 'prop' | 'get' | 'set'
+                    result[entry[1]] = self.eval(entry[2], scope)
             return result
 
         if op == "typeof":
@@ -344,8 +351,7 @@ class KarmazynJSCore:
             if isinstance(fn, Function):
                 local = Scope(fn.closure)
                 local.set("this", obj)
-                for p, a in zip(fn.params, args):
-                    local.set(p, a)
+                self._bind_params(local, fn.params, args)
                 try:
                     self.exec(fn.body, local)
                 except _Return as r:
@@ -458,6 +464,24 @@ class KarmazynJSCore:
         except AttributeError:
             return None
 
+    def _bind_params(self, local: "Scope", params: list, args: list) -> None:
+        """Wiąże parametry. Akceptuje nowy kształt z parsera
+        ('param'|'default'|'spread', nazwa[, default]) ORAZ stary (string)."""
+        for i, pspec in enumerate(params):
+            if isinstance(pspec, str):              # stary kształt
+                kind, name = "param", pspec
+            else:                                   # nowy kształt (krotka)
+                kind, name = pspec[0], pspec[1]
+            if kind == "spread":
+                local.set(name, list(args[i:]))     # rest → tablica
+                return
+            if i < len(args):
+                local.set(name, args[i])
+            elif kind == "default":
+                local.set(name, self.eval(pspec[2], local))  # domyślna widzi wcześniejsze param
+            else:
+                local.set(name, None)               # undefined
+
     def _call(self, fn: Any, args: List[Any],
                this: Any = None) -> Any:
         """Wywołuje Function, callable lub metodę obiektu.
@@ -474,10 +498,7 @@ class KarmazynJSCore:
 
         if isinstance(fn, Function):
             local = Scope(fn.closure)
-            for p, a in zip(fn.params, args):
-                local.set(p, a)
-            for p in fn.params[len(args):]:
-                local.set(p, None)
+            self._bind_params(local, fn.params, args)
             # Wstrzyknij this do scope jeśli podany
             if this is not None:
                 local.set("this", this)
@@ -651,6 +672,11 @@ class KarmazynJSCore:
 
             elif op == "block":
                 result = self.exec(stmt[1], scope.child())
+
+            elif op == "begin":
+                # jak block, ale w BIEŻĄCYM scope — grupowanie deklaracji
+                # (var a=1,b=2 / destrukturyzacja) wiąże w scope wywołującym
+                result = self.exec(stmt[1], scope)
 
             else:
                 raise SyntaxError(f"Nieznana instrukcja: {op!r}")

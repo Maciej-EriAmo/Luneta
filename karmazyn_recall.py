@@ -199,11 +199,38 @@ class Recall:
         Jeśli magazyn ma rezonans (karmazyn_phi) — używa go; inaczej term-overlap.
         Zwraca [(etykieta_strony, fragment, score, T), ...].
         """
+        if self.caps.get("tinted"):
+            res = self._recall_resonate(query, limit)
+            if res is not None:
+                return res
         if self.caps.get("semantic"):
             sem = self._recall_semantic(query, limit)
             if sem is not None:        # None = ścieżka semantyczna zawiodła → fallback
                 return sem
         return self._recall_terms(query, limit)
+
+    def _recall_resonate(self, query: str, limit: int
+                         ) -> Optional[List[Tuple[str, str, float, float]]]:
+        """
+        Rezonans ZNACZENIOWY przez store.resonate (embed, idea-level).
+        W pełni osłonięty: błąd lub brak trafień → None → następny tryb.
+        """
+        try:
+            atoms = self.runtime.resonate(query, top_k=limit) or []
+            hits = []
+            for a in atoms:
+                aid = getattr(a, "id", None)
+                try:
+                    a.touch()
+                except Exception:
+                    pass
+                url = self._atom_page(aid) or "?"
+                content = self._content(a)
+                hits.append((_short_label(url), content.strip()[:140],
+                             float(getattr(a, "T", 0.0)), float(getattr(a, "T", 0.0))))
+            return hits or None
+        except Exception:
+            return None
 
     def _recall_semantic(self, query: str, limit: int
                          ) -> Optional[List[Tuple[str, str, float, float]]]:
@@ -268,7 +295,9 @@ class Recall:
             "strony": len(pages),
             "atomy": n_atoms,
             "słownik": len(vocab),
-            "tryb": "rezonans (HRR)" if self.caps.get("semantic") else "term-overlap",
+            "tryb": ("rezonans idei (embed)" if self.caps.get("tinted")
+                     else "rezonans (substring)" if self.caps.get("semantic")
+                     else "term-overlap"),
         }
 
     # ── 4. EKSPORT DO KARMINQL (skalowanie → karmazyn_db) ─────────────────────

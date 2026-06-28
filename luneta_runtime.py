@@ -1,29 +1,10 @@
 """
-luneta_runtime.py — Lightweight Runtime dla Lunety v1.0
+luneta_runtime.py — Lightweight Runtime dla Lunety v1.1
 ========================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
-Lekki adapter runtime wystarczający do uruchomienia przeglądarki Luneta
-bez pełnego SanctuaryRuntime i jego zależności (numpy, HSSKarmazynMatrix,
-PhiPhysics, phi_space, karmazyn_ui).
-
-Oparty na karmazyn_atom.py (unified model).
-AtomRegistry jako matrix, proste Bubble/Hologram jako kontenery.
-
-Interfejs kompatybilny z tym czego używają:
-  karmazyn_browser.py  — create_atom, get_atom, matrix.has_atom
-  karmazyn_dom.py      — create_atom, get_atom, get_bubble, consolidate,
-                         import_to_bubble, archive_to_hologram, matrix.has_atom
-  karmazyn_js_web.py   — peek_atom, create_atom
-
-Użycie:
-    from luneta_runtime import LunetaRuntime
-    from karmazyn_browser import KarmazynBrowser
-
-    runtime = LunetaRuntime()
-    browser = KarmazynBrowser(runtime)
-    ok, msg = browser.go("https://example.com")
-    print(msg)
+Wersja 1.1: Dodano alias tick(), aby zintegrować cykl termodynamiczny
+ze środowiskiem graficznym karmazyn_display, eliminując problem zablokowanego GC.
 """
 
 import time
@@ -85,40 +66,30 @@ class LunetaRuntime:
 
     Zapewnia interfejs kompatybilny z SanctuaryRuntime
     bez zależności od numpy, HSSKarmazynMatrix, PhiPhysics.
-
-    Pola:
-      matrix  — AtomRegistry (kompatybilne z matrix.has_atom, matrix.atoms)
     """
 
     def __init__(self):
         self._bubbles:  Dict[str, LunetaBubble] = {}
         self._holograms: Dict[str, Dict[str, Any]] = {}
-        # Silnik: kanoniczny substrat z reach-GC, nie goły AtomRegistry.
-        # Osiągalność Lunety = atomy trzymane przez bąble-kontenery (płaskie
-        # członkostwo). Atom w bąblu przeżywa stygnięcie; sierota ginie.
         self.engine = KarmazynEngine(
             thermal=True,
             extra_reach=lambda: {aid for b in self._bubbles.values() for aid in b.atom_ids},
         )
-        # alias: konsumenci (browser/dom/js_web) wołają matrix.has_atom/atoms/get/stats
         self.matrix = self.engine.reg
 
     # ── Atomy ─────────────────────────────────────────────────────────────────
 
     def create_atom(self, id: str, S: str, E: str, T: float,
                     decay_rate: float = 0.0, **kwargs) -> Atom:
-        """Tworzy atom w rejestrze. Kompatybilne z SanctuaryRuntime."""
         if self.matrix.has(id):
             raise ValueError(f"Atom '{id}' już istnieje")
         atom = self.matrix.create(id, S=S, E=E, T=T, **kwargs)
         return atom
 
     def get_atom(self, id: str) -> Optional[Atom]:
-        """Zwraca atom lub None."""
         return self.matrix.get(id)
 
     def peek_atom(self, id: str) -> Optional[Atom]:
-        """Zwraca atom bez ogrzewania (peek). Alias get_atom dla Lunety."""
         return self.matrix.get(id)
 
     def has_atom(self, id: str) -> bool:
@@ -128,8 +99,8 @@ class LunetaRuntime:
         atom = self.matrix.get(id)
         if atom:
             atom.kill()
-            self.matrix.delete(id)               # usuń z rejestru — nie czekaj na GC
-            for b in self._bubbles.values():      # i z bąbli, które go trzymały
+            self.matrix.delete(id)
+            for b in self._bubbles.values():
                 if id in b.atom_ids:
                     b.atom_ids.remove(id)
         return atom
@@ -146,7 +117,6 @@ class LunetaRuntime:
     # ── Bąble ─────────────────────────────────────────────────────────────────
 
     def consolidate(self, label: str, metadata: dict = None) -> str:
-        """Tworzy bąbel z atomu. Zwraca bubble_label."""
         if label in self._bubbles:
             return f"bubble_{label}"
         atom = self.matrix.get(label)
@@ -164,18 +134,6 @@ class LunetaRuntime:
         return self._bubbles.get(label)
 
     def create_bubble(self, label: str, atom_ids: List[str]) -> Optional[str]:
-        """
-        Tworzy NAZWANY bąbel-kontener pod etykietą `label` i wchłania członków.
-
-        Członkami mogą być atomy LUB inne bąble (zagnieżdżenie) — tabela to
-        bąbel-wierszy, wiersz to bąbel-komórek. Wcześniej create_bubble
-        filtrował tylko po has_atom, więc bąbel tabeli (członkowie = bąble
-        wierszy) nie powstawał.
-
-        Różni się od consolidate(): consolidate(atom_id) tworzy bąbel nazwany
-        ID atomu. create_bubble(label, ids) tworzy bąbel nazwany `label`
-        zawierający wielu członków (atomy i/lub zagnieżdżone bąble).
-        """
         members = []
         for aid in atom_ids:
             if self.matrix.has(aid):
@@ -193,13 +151,12 @@ class LunetaRuntime:
                 atom = self.matrix.get(aid)
                 if atom is not None:
                     bubble.absorb(atom)
-            else:  # zagnieżdżony bąbel — referencja bez wchłaniania treści
+            else:
                 if aid not in bubble.atom_ids:
                     bubble.atom_ids.append(aid)
         return label
 
     def import_to_bubble(self, bubble_label: str, atom_id: str) -> bool:
-        """Importuje atom do istniejącego bąbla."""
         bubble = self._bubbles.get(bubble_label)
         if bubble is None:
             return False
@@ -214,10 +171,6 @@ class LunetaRuntime:
     def archive_to_hologram(self, topic: str, atom_ids: List[str],
                             remove_originals: bool = False,
                             n_components: int = 5) -> str:
-        """
-        Lekka wersja hologramu — dict z metadanymi, bez PCA/eigenvectors.
-        Wystarczający dla DOMMapper (potrzebuje tylko hid).
-        """
         import hashlib
         valid_ids = [aid for aid in atom_ids if self.matrix.has(aid)]
         if not valid_ids:
@@ -239,13 +192,15 @@ class LunetaRuntime:
 
     # ── Termodynamika ─────────────────────────────────────────────────────────
 
-    def step(self, n: int = 1) -> Dict[str, Any]:
-        """Tick termodynamiczny — decay + BEZPIECZNY reach-GC (silnik substratu).
-
-        Atom trzymany przez bąbel jest osiągalny → przeżywa stygnięcie (archiwum).
-        Tylko atom-sierota (w żadnym bąblu) ginie, gdy ostygnie. Naprawia bug,
-        w którym GC po samej temperaturze kasował treść strony spod bąbla.
+    def tick(self, *args, **kwargs) -> Dict[str, Any]:
         """
+        Alias metody step() wymagany przez karmazyn_display, by system w ogóle
+        rejestrował ten obiekt jako podlegający fizyce phi-space.
+        """
+        return self.step()
+
+    def step(self, n: int = 1) -> Dict[str, Any]:
+        """Tick termodynamiczny — decay + BEZPIECZNY reach-GC (silnik substratu)."""
         for _ in range(n):
             self.engine.tick()
         return self.status_summary()

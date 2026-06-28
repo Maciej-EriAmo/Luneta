@@ -1,34 +1,10 @@
 """
-karmazyn_atom.py — Unified Atom Model KarmazynOS v1.0
+karmazyn_atom.py — Unified Atom Model KarmazynOS v1.2
 ======================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
-Jeden model atomu zamiast czterech rozproszonych implementacji.
-Zastępuje:
-  PhiAtom   (karmazyn_js_phi.py)    — Python variable jako atom JS
-  HRRAtom   (karmazyn_hrr.py)       — atom z wektorem HRR
-  ręczne T  (karmazyn_dom.py)       — atom.T = ...; atom.state = ...
-  ręczne T  (karmazyn_browser.py)   — atom.T = temp; atom.state = ...
-
-Interfejs kompatybilny z istniejącym runtime.py:
-  atom.id, atom.S, atom.E, atom.T, atom.state
-  atom.touch(), atom.decay(), atom.is_dead(), atom.age()
-
-Nowe możliwości:
-  atom.heat(amount)     — bezpośrednie ogrzanie o kwotę
-  atom.vector           — opcjonalny wektor HRR (numpy)
-  atom.metadata         — dict dla dodatkowych danych
-  Atom.from_state(T)    — klasyfikacja stanu z T
-  AtomEvent             — zdarzenia emitowane przy zmianie stanu
-
-Użycie:
-    from karmazyn_atom import Atom, T_HOT, T_WARM, T_COLD, T_TOMB
-
-    a = Atom("my_atom", S="text:p", E="treść", T=60.0)
-    a.touch()          # ogrzej przy dostępie
-    a.decay()          # ostudź (wywołuj przez scheduler)
-    a.heat(20.0)       # ogrzej o konkretną kwotę
-    print(a.state)     # "HOT" / "WARM" / "COLD" / "TOMB"
+Wersja 1.2: Dodano zliczanie cykli (ticków) na poziomie Rejestru.
+Pasek narzędzi HUD wreszcie otrzyma bieżącą statystykę postępu czasu.
 """
 
 import time
@@ -41,7 +17,7 @@ T_INIT    = 50.0    # temperatura startowa (WARM)
 T_MAX     = 100.0   # temperatura maksymalna
 T_HOT     = 70.0    # próg HOT
 T_WARM    = 30.0    # próg WARM (poniżej = COLD)
-T_TOMB    = 2.0     # próg TOMB / GC
+T_TOMB    = 2.0     # próg TOMB / przekazanie do Vacuum
 
 DECAY_DEFAULT = 0.92   # mnożnik przy tick (stygnięcie)
 HEAT_READ     = 10.0   # przyrost przy odczycie
@@ -63,14 +39,6 @@ def state_for_T(T: float) -> str:
 class Atom:
     """
     Universalny atom KarmazynOS.
-
-    Pola zgodne z istniejącym runtime.py (kompatybilność wsteczna):
-      id, S, E, T, state
-
-    Dodatkowe:
-      vector   — opcjonalny wektor HRR (numpy ndarray)
-      metadata — dict dla specyficznych danych warstwy
-      age      — wiek atomu w sekundach
     """
 
     __slots__ = (
@@ -92,7 +60,7 @@ class Atom:
         self.E        = E
         self.T        = float(T)
         self.state    = state_for_T(self.T)
-        self.vector   = vector        # numpy array lub None
+        self.vector   = vector        
         self.metadata = metadata or {}
         self._born    = time.monotonic()
         self._reads   = 0
@@ -102,34 +70,28 @@ class Atom:
     # ── Interfejs termodynamiczny ──────────────────────────────────────────────
 
     def touch(self, weight: float = 1.0) -> None:
-        """Ogrzej przy dostępie (odczyt). weight > 1 = intensywniejszy dostęp."""
         self._reads += 1
         self.T = min(T_MAX, self.T + HEAT_READ * weight)
         self._update_state()
 
     def touch_write(self) -> None:
-        """Ogrzej przy zapisie (mniejszy przyrost niż read)."""
         self._writes += 1
         self.T = min(T_MAX, self.T + HEAT_WRITE)
         self._update_state()
 
     def heat(self, amount: float) -> None:
-        """Bezpośrednie ogrzanie o konkretną kwotę."""
         self.T = min(T_MAX, self.T + amount)
         self._update_state()
 
     def cool(self, amount: float) -> None:
-        """Bezpośrednie ochłodzenie o kwotę."""
         self.T = max(0.0, self.T - amount)
         self._update_state()
 
     def decay(self, rate: float = DECAY_DEFAULT) -> None:
-        """Stygnięcie — wywoływane przez scheduler co tick."""
         self.T *= rate
         self._update_state()
 
     def kill(self) -> None:
-        """Natychmiastowe przejście do TOMB (usunięcie węzła DOM itp.)."""
         self.T = T_TOMB * 0.5
         self._update_state()
 
@@ -137,7 +99,6 @@ class Atom:
         return self.T < T_TOMB
 
     def age(self) -> float:
-        """Wiek atomu w sekundach."""
         return time.monotonic() - self._born
 
     def _update_state(self) -> None:
@@ -151,7 +112,6 @@ class Atom:
                     pass
 
     def on_state_change(self, callback: Callable) -> None:
-        """Rejestruje callback wywoływany przy zmianie stanu."""
         self._on_state_change = callback
 
     # ── Właściwości ───────────────────────────────────────────────────────────
@@ -196,13 +156,15 @@ class Atom:
 class AtomRegistry:
     """
     Minimalny rejestr atomów.
-    Używany przez PhiSpace, JSPhi, DOMMapper.
-    Nie duplikuje logiki — tylko przechowuje i udostępnia.
+    Posiada strefę _vacuum do zarządzania cyklem rozpadu oraz
+    zlicza instancje wywołania tick() na użytek telemetrii.
     """
 
     def __init__(self):
         self._atoms: Dict[str, Atom] = {}
+        self._vacuum: Dict[str, Atom] = {} 
         self._generation: int = 0
+        self._tick_count: int = 0
 
     def create(self, id: str, S: str = "", E: str = "",
                T: float = T_INIT, **kwargs) -> Atom:
@@ -226,30 +188,40 @@ class AtomRegistry:
 
     @property
     def atoms_wrapper(self) -> "AtomsWrapper":
-        """Zwraca AtomsWrapper — wspiera atoms() i iterację."""
         return AtomsWrapper(self)
 
     def atoms(self) -> List[Atom]:
-        """Zwraca listę wszystkich żywych atomów."""
         return list(self._atoms.values())
 
     def tick(self, rate: float = DECAY_DEFAULT) -> List[str]:
-        """
-        Decay wszystkich atomów. Zwraca id martwych (do GC).
-        Wywoływany przez ThermalScheduler.
-        """
+        self._tick_count += 1
         dead = []
+        
         for id, atom in list(self._atoms.items()):
             atom.decay(rate)
             if atom.is_dead():
                 dead.append(id)
+                
+        if dead:
+            self.gc(dead)
+            
+        vacuum_dust = []
+        for id, atom in list(self._vacuum.items()):
+            atom.decay(rate)
+            if atom.T < 0.1:
+                vacuum_dust.append(id)
+                
+        for id in vacuum_dust:
+            del self._vacuum[id]
+
         return dead
 
     def gc(self, dead_ids: List[str]) -> int:
-        """Usuń martwe atomy. Zwraca liczbę usuniętych."""
         removed = 0
         for id in dead_ids:
-            if self._atoms.pop(id, None) is not None:
+            atom = self._atoms.pop(id, None)
+            if atom is not None:
+                self._vacuum[id] = atom
                 removed += 1
         if removed > 0:
             self._generation += 1
@@ -264,11 +236,12 @@ class AtomRegistry:
     def stats(self) -> Dict[str, int]:
         atoms = list(self._atoms.values())
         return {
-            "total": len(atoms),
+            "total": len(atoms) + len(self._vacuum),
             "HOT":   sum(1 for a in atoms if a.is_hot),
             "WARM":  sum(1 for a in atoms if a.is_warm),
             "COLD":  sum(1 for a in atoms if a.is_cold),
-            "TOMB":  sum(1 for a in atoms if a.is_tomb),
+            "TOMB":  len(self._vacuum),
+            "tick":  self._tick_count,
         }
 
     def __len__(self) -> int:
@@ -277,24 +250,13 @@ class AtomRegistry:
     def __contains__(self, id: str) -> bool:
         return id in self._atoms
 
-    # Kompatybilność z runtime.py: matrix.has_atom(), matrix.atoms()
     def has_atom(self, id: str) -> bool:
         return self.has(id)
 
 
 class AtomsWrapper:
     """
-    Wrapper AtomRegistry wspierający dwa style dostępu:
-      matrix.atoms()  — wywołanie jako funkcja (oryginalny API)
-      matrix.atoms    — użycie jako property/iterowalny obiekt
-
-    Rozwiązuje niekompatybilność między modułami które używają
-    różnych konwencji dostępu do listy atomów.
-
-    Używany przez PhiBuffer, draw_phi_map, zewnętrzne narzędzia.
-
-    FIX v1.1: cache invalidacja przez generation counter zamiast len().
-    len() nie wykrywa replace (delete+create przy tym samym rozmiarze).
+    Wrapper AtomRegistry wspierający dwa style dostępu.
     """
 
     def __init__(self, registry: "AtomRegistry"):
@@ -303,7 +265,6 @@ class AtomsWrapper:
         self._cache_gen = -1
 
     def _get_list(self) -> List["Atom"]:
-        """Zwraca listę atomów — z cache jeśli generacja się nie zmieniła."""
         current_gen = self._reg._generation
         if self._cache is None or self._cache_gen != current_gen:
             self._cache     = list(self._reg._atoms.values())
@@ -311,11 +272,9 @@ class AtomsWrapper:
         return self._cache
 
     def __call__(self) -> List["Atom"]:
-        """Pozwala wywołać atoms() jako funkcję."""
         return self._get_list()
 
     def __iter__(self):
-        """Pozwala iterować bezpośrednio: for atom in matrix.atoms."""
         return iter(self._reg._atoms.values())
 
     def __len__(self) -> int:

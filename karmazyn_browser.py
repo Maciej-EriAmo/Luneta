@@ -1,16 +1,14 @@
 """
-karmazyn_browser.py — Luneta v5.5 (Smart Data Islands & Article Bypass)
+karmazyn_browser.py — Luneta v5.6 (SPA Rescue Mode)
 ========================================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
-Zmiany v5.5:
-- Złagodzono blokadę Wysp Danych. Aby rozwiązać problem braku artykułów 
-  na agresywnych portalach SPA (WP, Onet), przywrócono kradzież treści 
-  ze <script id="__NEXT_DATA__"> i application/json. 
-- Wprowadzono "Smart Extraction". Zamiast zrzucać do widoku każdego, pociętego 
-  stringa z JSONa, szukamy i renderujemy tylko te, które zawierają w sobie HTML 
-  (np. akapity zaczynające się od <p>). Eliminuje to śmietnik nawigacyjny, a 
-  przywraca pełne artykuły na stronach z SSR.
+Zmiany v5.6:
+- Integracja Trybu Ratunkowego SPA. Silnik analizuje zrzucone tagi <script>. 
+  Jeśli zbudowane drzewo DOM okaże się niemal puste (brak SSR), parser 
+  wydobywa za pomocą wyrażeń regularnych ukryte łańcuchy znaków i sztucznie 
+  wstrzykuje je do układu strony. Pozwala to na dostęp do treści z React/Apollo 
+  (np. Khan Academy).
 """
 
 import gzip
@@ -351,12 +349,6 @@ class ParsedPage:
         return cleaned
 
 def _extract_smart_html_from_json(obj) -> List[str]:
-    """
-    Heurystyka "Smart Data Island". Szukamy tylko zagnieżdżonych struktur
-    lub długich ciągów znaków (np. całych artykułów), które posiadają tagi HTML,
-    świadcząc o tym, że są "zredagowanym" contentem przekazanym w JSON.
-    W ten sposób omijamy techniczny szum z Next.js/Reacta.
-    """
     texts = []
     if isinstance(obj, dict):
         for k, v in obj.items():
@@ -385,6 +377,9 @@ class SemanticHTMLParser(HTMLParser):
         
         self.in_data_script = False
         self.data_script_content = ""
+        
+        self.in_any_script = False
+        self.all_scripts_content = ""
 
     def _is_hidden(self, attrs):
         style = attrs.get('style', '').replace(' ', '').lower()
@@ -395,8 +390,10 @@ class SemanticHTMLParser(HTMLParser):
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
-        
         ad = {k: (v if v is not None else '') for k, v in attrs}
+        
+        if tag == 'script':
+            self.in_any_script = True
         
         is_data_script = tag == 'script' and (
             ad.get('type', '').lower() in ('application/json', 'application/ld+json', 'application/json+oembed') 
@@ -445,6 +442,9 @@ class SemanticHTMLParser(HTMLParser):
     def handle_endtag(self, tag):
         tag = tag.lower()
         
+        if tag == 'script':
+            self.in_any_script = False
+        
         if self.in_data_script and tag == 'script':
             self.in_data_script = False
             try:
@@ -455,7 +455,7 @@ class SemanticHTMLParser(HTMLParser):
                     sub_parser.feed(html_fragment)
                     for child_node in sub_parser.root.children:
                         self.stack[-1].children.append(child_node)
-            except Exception as e:
+            except Exception:
                 pass
             return
 
@@ -485,6 +485,9 @@ class SemanticHTMLParser(HTMLParser):
         self.handle_endtag(tag)
 
     def handle_data(self, data):
+        if getattr(self, 'in_any_script', False):
+            self.all_scripts_content += data
+            
         if self.in_data_script:
             self.data_script_content += data
             return
@@ -506,6 +509,50 @@ class SemanticHTMLParser(HTMLParser):
         self.handle_data(html.unescape(f'&{name};'))
     def handle_charref(self, name):
         self.handle_data(html.unescape(f'&#{name};'))
+
+    def _rescue_spa_content(self):
+        """Heurystyka uderzeniowa: ratowanie danych ze stanu Apollo / React jeśli HTML to wydmuszka."""
+        if len(self.root.get_plain_text().strip()) > 200:
+            return
+            
+        candidates = re.findall(r'"([^"\\]*(?:\\.[^"\\]*)*)"', self.all_scripts_content)
+        valid = []
+        for c in candidates:
+            try:
+                c = c.encode('utf-8', errors='ignore').decode('unicode_escape', errors='ignore')
+            except Exception:
+                pass
+            if len(c) > 60 and ' ' in c and not c.startswith('http'):
+                # Odrzucanie kodu, ścieżek wektorowych i deklaracji CSS
+                if re.search(r'(var |let |const |=>|function\s*\(|;\})', c): continue
+                if re.match(r'^[MmZzLlHhVvCcSsQqTtAa0-9\s,\.\-]+$', c): continue
+                if 'px;' in c or '{' in c or '}' in c: continue
+                
+                clean_text = re.sub(r'<[^>]+>', '', c)
+                clean_text = re.sub(r'\s+', ' ', clean_text).strip()
+                
+                if len(clean_text) > 40:
+                    valid.append(clean_text)
+                    
+        if valid:
+            seen = set()
+            unique_valid = []
+            for v in valid:
+                if v not in seen:
+                    seen.add(v)
+                    unique_valid.append(v)
+                    
+            hr = SemanticNode(NodeType.HR, 'hr')
+            self.root.children.append(hr)
+            
+            warning = SemanticNode(NodeType.HEADING, 'h3')
+            warning.children.append(SemanticNode(NodeType.TEXT, text="[Karmin-engine: Tryb Ratunkowy SPA - Surowe dane ze skryptów]"))
+            self.root.children.append(warning)
+            
+            for text in unique_valid:
+                p = SemanticNode(NodeType.BLOCK, 'p')
+                p.children.append(SemanticNode(NodeType.TEXT, text=text))
+                self.root.children.append(p)
 
 class ANSIRenderer:
     def __init__(self, base_url, width):
@@ -635,6 +682,10 @@ def parse_html(html_text, url='', width=DISPLAY_WIDTH, truncated=False):
     parser = SemanticHTMLParser(base_url=url, width=width)
     try: parser.feed(html_text)
     except Exception as e: print(f'[Browser Error] parse_html: {e}', file=sys.stderr)
+    
+    # Ratowanie zawartości ze stron bez klasycznego SSR
+    parser._rescue_spa_content()
+    
     renderer = ANSIRenderer(url, width)
     renderer.render(parser.root)
     return ParsedPage(
@@ -801,7 +852,6 @@ class LunetaBrowser:
     def _render_current(self):
         if not self._current: return 'Brak strony.'
         
-        # Jeśli uruchomiono w trybie graficznym, odcinamy procesorożerny render ANSI
         if getattr(self, 'gui_mode', False):
             return ""
             

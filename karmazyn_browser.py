@@ -229,7 +229,7 @@ class HttpResponse:
     def ok(self) -> bool:
         return 200 <= self.status < 300
 
-DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"
+DEFAULT_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
 
 def http_get(url, headers=None, timeout=15.0):
     supported = ['gzip', 'deflate']
@@ -367,7 +367,6 @@ def _extract_smart_html_from_json(obj) -> List[str]:
         for item in obj:
             texts.extend(_extract_smart_html_from_json(item))
     elif isinstance(obj, str):
-        # Akceptuj, jeśli string ma > 100 znaków i wygląd HTML-a (posiada np. <p> lub <div>).
         if len(obj) > 100 and bool(re.search(r'<(p|div|br|strong|h[1-6])[^>]*>', obj, re.IGNORECASE)):
             texts.append(obj)
     return texts
@@ -452,12 +451,8 @@ class SemanticHTMLParser(HTMLParser):
                 payload = json.loads(self.data_script_content)
                 html_fragments = _extract_smart_html_from_json(payload)
                 for html_fragment in html_fragments:
-                    # Traktujemy wykradziony HTML jako pod-drzewo do sparsowania, 
-                    # by uwzględnić strukturę i atomy w phi-space!
                     sub_parser = SemanticHTMLParser(base_url=self.base_url, width=self.width)
                     sub_parser.feed(html_fragment)
-                    
-                    # Dołączamy sparsowane korzenie wyciągniętego z JSONa HTMLa
                     for child_node in sub_parser.root.children:
                         self.stack[-1].children.append(child_node)
             except Exception as e:
@@ -805,6 +800,11 @@ class LunetaBrowser:
 
     def _render_current(self):
         if not self._current: return 'Brak strony.'
+        
+        # Jeśli uruchomiono w trybie graficznym, odcinamy procesorożerny render ANSI
+        if getattr(self, 'gui_mode', False):
+            return ""
+            
         cache_key = (self._current.url, self._scroll, self.width, self._dom_version)
         if self._render_cache is not None and self._render_cache_info == cache_key:
             return self._render_cache

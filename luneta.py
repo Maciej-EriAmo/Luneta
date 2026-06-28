@@ -1,10 +1,16 @@
 """
-luneta.py — Punkt wejścia Windows CLI dla Lunety v2.2
+luneta.py — Punkt wejścia Windows CLI dla Lunety v2.3
 ======================================================
 KarmazynOS — Maciej Mazur, Warsaw 2026
 
-Wersja 2.2: Automatyczny start w trybie płótna graficznego. 
-Przeglądarka natychmiast przejmuje ekran, a terminal REPL 
+Wersja 2.3: Tryb płótna graficznego z reaktywnym podgrzewaniem
+substratu pod kursorem (hover-heat). Najechanie na fragment tekstu
+podgrzewa atom powiązany z węzłem DOM — sygnał uwagi mapowany na
+ciepło. Ciepło aplikowane jest na WEJŚCIU w węzeł (zmiana stanu)
+z throttlingiem, nigdy w pętli klatka-po-klatce.
+
+Wersja 2.2: Automatyczny start w trybie płótna graficznego.
+Przeglądarka natychmiast przejmuje ekran, a terminal REPL
 pozostaje w tle jako fallback pod klawiszem ESC.
 """
 
@@ -154,7 +160,7 @@ class DOMRenderer:
             self.font_cache[key] = self.font.render(text, True, color)
         return self.font_cache[key]
 
-    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect):
+    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect, hovered_box=None):
         import pygame
         old_clip = ctx.surface.get_clip()
         ctx.surface.set_clip(clip_rect)
@@ -166,21 +172,31 @@ class DOMRenderer:
                 continue
             if box_y > clip_rect.bottom:
                 break
+            
+            # Poświata pod kursorem — rozjaśniamy kolor o stałą wartość,
+            # z nasyceniem na 255. Bazowy box.color pozostaje nietknięty.
+            draw_color = box.color
+            if hovered_box is not None and box is hovered_box:
+                draw_color = (
+                    min(255, box.color[0] + 80),
+                    min(255, box.color[1] + 80),
+                    min(255, box.color[2] + 80),
+                )
                 
             if box.box_type in ("text", "heading", "link"):
-                surf = self._get_text_surface(box.text, box.color)
+                surf = self._get_text_surface(box.text, draw_color)
                 ctx.surface.blit(surf, (box.rect.x, box_y))
                 
                 if box.box_type == "link":
                     pygame.draw.line(
-                        ctx.surface, box.color,
+                        ctx.surface, draw_color,
                         (box.rect.x, box_y + self.font.get_height()),
                         (box.rect.x + surf.get_width(), box_y + self.font.get_height())
                     )
 
             elif box.box_type == "hr":
                 pygame.draw.line(
-                    ctx.surface, box.color, 
+                    ctx.surface, draw_color,
                     (box.rect.x, box_y), 
                     (box.rect.x + box.rect.w, box_y)
                 )
@@ -190,9 +206,13 @@ class DOMRenderer:
 
 # ─── 4. ADAPTER WIDOKU (GraphicPageViewer) ──────────────────────────────────
 class GraphicPageViewer:
-    def __init__(self, browser, close_callback):
+    def __init__(self, browser, close_callback, mapper=None):
         self.browser = browser
         self.close_callback = close_callback
+        # Mapper DOM↔atom (autorytet z attach_to_browser). Trzymany dla
+        # ewentualnych przyszłych zapytań; samo hover-heat go nie potrzebuje —
+        # rozwiązuje atomy przez węzłowe _atom_refs i browser.runtime.get_atom.
+        self.mapper = mapper
         
         self.scroll_y = 0
         self.max_scroll = 0
@@ -207,6 +227,13 @@ class GraphicPageViewer:
         self.url_text = ""
         self.btn_back_rect = None
         self.input_url_rect = None
+
+        # ── Stan hover-heat ──────────────────────────────────────────────
+        self.hovered_box = None          # box aktualnie pod kursorem (do poświaty)
+        self._last_heated_node = None    # węzeł ostatnio podgrzany (detekcja wejścia)
+        self._last_heat_ms = 0           # znacznik czasu ostatniego podgrzania
+        self.heat_repeat_ms = 400        # min. odstęp ponownego podgrzania TEGO SAMEGO węzła
+        self.hover_weight = 1.0          # siła sygnału uwagi (świadomie nie 2.0 — patrz uwagi)
 
     def wants_keys(self):
         return True
@@ -285,6 +312,89 @@ class GraphicPageViewer:
                         return True
         return False
 
+    # ── HOVER-HEAT: detekcja (czysta) ────────────────────────────────────
+    def _find_hovered_box(self, mx: int, my: int, top_limit: int, bottom_limit: int):
+        """Zwraca box tekstowy pod kursorem albo None. Bez efektów ubocznych.
+
+        Granice (top_limit/bottom_limit) są dynamiczne — bierzemy je z
+        rzeczywistego clip_rect renderu, więc nic nie jest zaszyte na sztywno.
+        """
+        import pygame
+        if my < top_limit or my > bottom_limit:
+            return None
+        for box in self.layout_boxes:
+            if box.box_type not in ("text", "heading", "link"):
+                continue
+            draw_top = box.rect.y - self.scroll_y
+            if draw_top + box.rect.h < top_limit:
+                continue
+            if draw_top > bottom_limit:
+                break
+            hit = pygame.Rect(box.rect.x, draw_top, box.rect.w, box.rect.h)
+            if hit.collidepoint(mx, my):
+                return box
+        return None
+
+    # ── HOVER-HEAT: etykiety atomów węzła ────────────────────────────────
+    def _atom_labels_for_node(self, node):
+        """Zwraca krotkę etykiet atomów powiązanych z węzłem DOM.
+
+        Wiązanie pochodzi z DOMMapper._walk, który przy mapowaniu strony
+        stempluje węzeł polem _atom_refs (lista etykiet). To JEDYNE wiążące
+        źródło — etykiety atomów są syntetyczne i sekwencyjne
+        (np. 'dom_<hash>_txt3'), więc nie da się ich odtworzyć z treści węzła.
+        Gdy węzeł nie był zmapowany (np. tekst nieczytelny albo remap-guard
+        300 s pominął ponowny walk po re-parsie), zwracamy pustą krotkę i
+        podgrzewanie po prostu milczy.
+        """
+        refs = getattr(node, "_atom_refs", None)
+        if not refs:
+            return ()
+        return tuple(refs)
+
+    # ── HOVER-HEAT: aplikacja ciepła (na wejściu + throttle) ─────────────
+    def _apply_hover_heat(self, box, now_ms: int):
+        """Podgrzewa atomy pod kursorem.
+
+        Kluczowa różnica względem naiwnej wersji: ciepło leci TYLKO przy
+        zmianie węzła (wejście kursora na nowy fragment) albo po upływie
+        heat_repeat_ms, gdy kursor wciąż stoi nad tym samym węzłem.
+        Nigdy 60×/s — przy HEAT_READ=10.0 to byłby natychmiastowy przegrzew
+        substratu do T_MAX.
+        """
+        node = getattr(box, "node", None) if box is not None else None
+        if node is None:
+            self._last_heated_node = None
+            return
+
+        changed = node is not self._last_heated_node
+        if not changed and (now_ms - self._last_heat_ms) < self.heat_repeat_ms:
+            return
+
+        labels = self._atom_labels_for_node(node)
+        runtime = getattr(self.browser, "runtime", None)
+        getter = getattr(runtime, "get_atom", None) if runtime is not None else None
+
+        if labels and callable(getter):
+            # Jeden węzeł tekstowy może odpowiadać kilku atomom zdaniowym —
+            # podgrzewamy wszystkie, bo layout nie wie, które słowo to które zdanie.
+            for label in labels:
+                try:
+                    atom = getter(label)
+                except Exception:
+                    continue
+                if atom is None:
+                    continue
+                touch = getattr(atom, "touch", None)
+                if callable(touch):
+                    try:
+                        touch(weight=self.hover_weight)
+                    except Exception:
+                        pass
+
+        self._last_heated_node = node
+        self._last_heat_ms = now_ms
+
     def _rebuild_layout_if_needed(self, ctx: DrawCtx, page):
         version = getattr(self.browser, '_dom_version', 0)
         if page.url == self.last_page_url and version == self.last_dom_version:
@@ -296,6 +406,11 @@ class GraphicPageViewer:
         self.last_page_url = page.url
         self.last_dom_version = version
         self.scroll_y = 0
+
+        # Nowa strona/wersja DOM — reset stanu hover-heat, by stare
+        # referencje węzłów nie blokowały podgrzania na nowym drzewie.
+        self.hovered_box = None
+        self._last_heated_node = None
 
         tree = getattr(page, "semantic_tree", None)
         if not tree:
@@ -361,14 +476,22 @@ class GraphicPageViewer:
             return
 
         clip_rect = pygame.Rect(ctx.rect.x, ctx.rect.y + self.nav_h, ctx.rect.w, ctx.rect.h - self.nav_h)
-        self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect)
+
+        # ── HOVER-HEAT: detekcja + aplikacja, granice z realnego clip_rect ──
+        mx, my = pygame.mouse.get_pos()
+        top_limit = ctx.rect.y + self.nav_h
+        self.hovered_box = self._find_hovered_box(mx, my, top_limit, clip_rect.bottom)
+        self._apply_hover_heat(self.hovered_box, pygame.time.get_ticks())
+
+        self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect, self.hovered_box)
 
 
 def show_help(term_state):
-    help_text = """=== LUNETA — Przeglądarka phi-space v2.2 ===
+    help_text = """=== LUNETA — Przeglądarka phi-space v2.3 ===
 Wpisz URL, aby przejść do strony.
 Komenda 'canvas' lub 'view' otwiera pełnoekranowe płótno graficzne.
-W trybie płótna naciśnij ESC lub F1, aby powrócić do konsoli."""
+W trybie płótna naciśnij ESC lub F1, aby powrócić do konsoli.
+Najechanie kursorem na tekst podgrzewa odpowiadający mu atom substratu."""
     term_state.append(help_text, (200, 200, 200))
 
 
@@ -394,7 +517,7 @@ def main():
     display.bind_phi(runtime)
     display.bind_browser(browser)
 
-    viewer = GraphicPageViewer(browser, display.renderer.release_fullscreen)
+    viewer = GraphicPageViewer(browser, display.renderer.release_fullscreen, mapper=mapper)
 
     # NATYCHMIASTOWE WYMUSZENIE WIDOKU GRAFICZNEGO PRZY STARCIE
     display.renderer.claim_fullscreen(viewer)

@@ -154,6 +154,8 @@ class DOMMapper:
                     sent_atoms.append(aid)
                     ctx.atom_ids.append(aid)
             
+            if sent_atoms:
+                setattr(node, "_atom_refs", list(sent_atoms))
             if len(sent_atoms) == 1: return sent_atoms[0]
             elif len(sent_atoms) > 1:
                 bubble_label = ctx.next_id("txtb")
@@ -170,7 +172,9 @@ class DOMMapper:
             T     = _semantic_T(role, ctx.depth)
             label = ctx.next_id(f"h{level}")
             aid   = self._make_atom(label, S=role, E=text, T=T)
-            if aid: ctx.atom_ids.append(aid)
+            if aid:
+                ctx.atom_ids.append(aid)
+                setattr(node, "_atom_refs", [aid])
             return aid
 
         if typ == NODE_LINK:
@@ -182,7 +186,9 @@ class DOMMapper:
             T     = _semantic_T("link", ctx.depth)
             label = ctx.next_id("lnk")
             aid   = self._make_atom(label, S=f"link:{text[:64]}", E=href, T=T)
-            if aid: ctx.atom_ids.append(aid)
+            if aid:
+                ctx.atom_ids.append(aid)
+                setattr(node, "_atom_refs", [aid])
             return aid
 
         if typ == NODE_PRE:
@@ -191,7 +197,9 @@ class DOMMapper:
             T     = _semantic_T("pre", ctx.depth)
             label = ctx.next_id("pre")
             aid   = self._make_atom(label, S="code", E=text[:self.MAX_E_LEN], T=T)
-            if aid: ctx.atom_ids.append(aid)
+            if aid:
+                ctx.atom_ids.append(aid)
+                setattr(node, "_atom_refs", [aid])
             return aid
 
         if typ == NODE_HR: return None

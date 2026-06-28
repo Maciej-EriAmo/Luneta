@@ -363,16 +363,13 @@ def draw_hud(surface: "pygame.Surface", font: "pygame.font.Font",
     hot    = stats.get("HOT",  0)
     warm   = stats.get("WARM", 0)
     cold   = stats.get("COLD", 0)
-    tick   = stats.get("tick", 0)
 
     parts = [
         (f" {app_name}  ", C_ACCENT),
         (f"HOT:{hot} ",    C_HOT),
         (f"WARM:{warm} ",  C_WARM),
         (f"COLD:{cold} ",  C_COLD),
-        (f"tick:{tick}  ", C_FG),
         (f"up:{uptime}",   (100, 100, 100)),
-        (f"  F1=zamknij-panel  F2=phi-map  ESC=wyjście", (70, 70, 70)),
     ]
     x = 4
     for text, color in parts:
@@ -779,20 +776,14 @@ class ImmediateRenderer:
                     return True
 
         if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE and not self._editor:
-                return False
+            # ESC nie zamyka juz aplikacji — przechodzi dalej do _wm_handler
+            # (np. GraphicPageViewer.on_key), ktory robi powrot do konsoli
+            # (close_callback -> release_fullscreen). Wyjscie z aplikacji:
+            # Ctrl+Q albo czerwony przycisk X na HUD.
             ctrl = event.mod & pygame.KMOD_CTRL
             if ctrl and event.key == pygame.K_q and not self._editor:
                 return False
-            if event.key == pygame.K_F1 and not self._editor:
-                if self._wm_handler:
-                    self.release_fullscreen()
-                else:
-                    self.release_left()
-                return True
-            if event.key == pygame.K_F2 and not self._editor:
-                self.toggle_phi()
-                return True
+            # F1 (zamknij-panel) oraz F2 (phi-map) wylaczone na zyczenie.
 
             if self._wm_handler is not None and self._wm_handler.wants_keys():
                 self._wm_handler.on_key(event)

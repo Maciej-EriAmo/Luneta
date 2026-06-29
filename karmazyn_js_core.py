@@ -110,8 +110,23 @@ class Function:
 
 # ─── Operatory ────────────────────────────────────────────────────────────────
 
+def _js_str(v):
+    """Konwersja wartości na string wg JS (do koercji przy operatorze +)."""
+    if v is None:            return "null"
+    if isinstance(v, bool):  return "true" if v else "false"
+    if isinstance(v, float):
+        return str(int(v)) if (v == int(v) and abs(v) < 1e16) else repr(v)
+    return str(v)
+
+def _js_add(a, b):
+    """JS +: gdy którykolwiek operand jest stringiem -> konkatenacja z koercją;
+    inaczej dodawanie liczbowe."""
+    if isinstance(a, str) or isinstance(b, str):
+        return _js_str(a) + _js_str(b)
+    return a + b
+
 _OPS = {
-    "+":   lambda a, b: a + b,
+    "+":   _js_add,
     "-":   lambda a, b: a - b,
     "*":   lambda a, b: a * b,
     "/":   lambda a, b: a / b if b != 0 else float("inf"),

@@ -44,32 +44,266 @@ except ImportError:
     def cmd_async(args, bridge):
         return None
 
+try:
+    from luneta_image_loader import ImageLoader
+    _HAS_IMAGES = True
+except ImportError:
+    _HAS_IMAGES = False
+    ImageLoader = None
+
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub('', str(text))
 
 
+# ─── 0. STYL INLINE (bitmaska na LayoutBox) ─────────────────────────────────
+STYLE_NONE   = 0
+STYLE_BOLD   = 1
+STYLE_ITALIC = 2
+
+# Znaki zerowej szerokości / formatujące — usuwamy je ze słów, bo pygame-ce
+# rzuca "Text has zero width" przy renderze tekstu o zerowej szerokości, a same
+# tworzyłyby widmowe pudełka. ZWSP, ZWNJ, ZWJ, word-joiner, BOM, miękki dywiz.
+_ZERO_WIDTH = "\u200b\u200c\u200d\u2060\ufeff\u00ad"
+_ZW_TABLE = {ord(c): None for c in _ZERO_WIDTH}
+
+
+def _brighten(color, amount: int):
+    """Rozjaśnia kolor o stałą wartość z nasyceniem na 255."""
+    return (
+        min(255, color[0] + amount),
+        min(255, color[1] + amount),
+        min(255, color[2] + amount),
+    )
+
+
+def _inline_style_bits(node) -> int:
+    """Wkład węzła INLINE w styl jego potomków.
+
+    Parser tworzy SemanticNode(NodeType.INLINE, tag) dla <b>/<strong>/<i>/<em>.
+    Sam węzeł INLINE nie niesie tekstu — styl spływa na potomne węzły TEXT.
+    """
+    if getattr(node, "typ", None) == NodeType.INLINE:
+        tag = getattr(node, "tag", "")
+        if tag in ("b", "strong"):
+            return STYLE_BOLD
+        if tag in ("i", "em"):
+            return STYLE_ITALIC
+    return STYLE_NONE
+
+
+# ─── 0c. POLA FORMULARZA ────────────────────────────────────────────────────
+_FIELD_TAGS = ("input", "textarea", "button", "select")
+
+
+def _field_kind(node):
+    """Klasyfikuje węzeł INLINE pola formularza na rodzaj obsługiwany w v1.
+
+    Zwraca: 'text' | 'password' | 'textarea' | 'submit' | 'button' | 'select'
+    | 'hidden' albo None (rodzaj pominięty w v1: checkbox/radio/file).
+    """
+    tag = getattr(node, "tag", "")
+    attrs = getattr(node, "attrs", {}) or {}
+    if tag == "input":
+        t = (attrs.get("type", "text") or "text").lower()
+        if t == "hidden":             return "hidden"
+        if t in ("submit", "image"):  return "submit"
+        if t in ("button", "reset"):  return "button"
+        if t in ("checkbox", "radio"):  return t
+        if t == "file":                 return None  # upload plików — niewspierany
+        if t == "password":             return "password"
+        return "text"
+    if tag == "textarea":
+        return "textarea"
+    if tag == "button":
+        t = (attrs.get("type", "submit") or "submit").lower()
+        return "submit" if t == "submit" else "button"
+    if tag == "select":
+        return "select"
+    return None
+
+
+def _gather_options(node):
+    """Zwraca (lista_opcji, indeks_wybrany) dla węzła <select>.
+
+    Każda opcja to (value, label). value bierzemy z atrybutu, a gdy go brak —
+    z tekstu opcji (zgodnie z HTML). 'selected' wskazuje domyślny wybór.
+    Skanujemy rekurencyjnie (np. przez <optgroup>).
+    """
+    opts = []
+    sel = -1
+
+    def walk(n):
+        nonlocal sel
+        for c in getattr(n, "children", []) or []:
+            ctag = getattr(c, "tag", "")
+            cattrs = getattr(c, "attrs", {}) or {}
+            if ctag == "option":
+                label = c.get_plain_text().strip()
+                raw = cattrs.get("value")
+                value = raw if raw is not None else label
+                if "selected" in cattrs:
+                    sel = len(opts)
+                opts.append((value, label or value))
+            else:
+                walk(c)
+
+    walk(node)
+    if sel < 0:
+        sel = 0 if opts else -1
+    return opts, sel
+
+
+# ─── 0d. WYBÓR ADRESU OBRAZU (lazy-load / srcset) ───────────────────────────
+def _is_svg(url: str) -> bool:
+    u = url.split("?", 1)[0].split("#", 1)[0].lower()
+    return u.endswith(".svg") or u.endswith(".svgz") or url[:14].lower() == "data:image/svg"
+
+
+def _parse_srcset(srcset: str, base_url: str):
+    """Parsuje atrybut srcset -> [(url_absolutny, score)].
+
+    Deskryptor 'w' = szerokość w px, 'x' = gęstość, brak = 1.0. Parsowanie
+    pragmatyczne (split po przecinku, potem po spacji) — pokrywa przytłaczającą
+    większość realnych srcset (przecinki w URL są rzadkie i zwykle zakodowane).
+    """
+    out = []
+    for part in srcset.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        toks = part.split()
+        url = toks[0]
+        score = 1.0
+        if len(toks) > 1:
+            d = toks[1].strip().lower()
+            try:
+                if d.endswith("w"):
+                    score = float(d[:-1])
+                elif d.endswith("x"):
+                    score = float(d[:-1])
+            except ValueError:
+                pass
+        out.append((urllib.parse.urljoin(base_url, url), score))
+    return out
+
+
+def _pick_image_src(attrs: dict, base_url: str) -> str:
+    """Wybiera najlepszy adres obrazu: lazy-load i srcset przed surowym src,
+    raster przed SVG, a wśród rastrów największy wariant.
+
+    Priorytet źródła (gdy rozmiary równe): srcset/data-* (realny cel) > src
+    (który przy lazy-loadzie bywa tylko placeholderem 1x1).
+    """
+    candidates = []   # (priorytet_źródła, score, url)
+    for key in ("data-srcset", "srcset"):
+        v = attrs.get(key)
+        if v:
+            for url, score in _parse_srcset(v, base_url):
+                candidates.append((2, score, url))
+    for key in ("data-src", "data-original", "data-lazy-src", "data-lazy"):
+        v = attrs.get(key)
+        if v and v.strip():
+            candidates.append((2, 1.0, urllib.parse.urljoin(base_url, v.strip())))
+    v = attrs.get("src")
+    if v and v.strip():
+        candidates.append((1, 1.0, urllib.parse.urljoin(base_url, v.strip())))
+
+    if not candidates:
+        return ""
+    # Preferuj rastry; jeśli są wyłącznie SVG, dopiero wtedy bierzemy SVG.
+    raster = [c for c in candidates if not _is_svg(c[2])]
+    pool = raster if raster else candidates
+    pool.sort(key=lambda c: (c[0], c[1]), reverse=True)
+    return pool[0][2]
+
+
+def _media_matches(media: str, viewport_w: int) -> bool:
+    """Dopasowanie <source media> do szerokości widoku. Obsługuje min/max-width
+    (też -device-width). Cechy nie-szerokościowe (orientation, resolution...) są
+    ignorowane = traktowane jako spełnione, żeby nie odrzucać źródła zbyt ostro.
+    Klauzule łączone 'and' — wszystkie ograniczenia szerokości muszą zachodzić."""
+    m = (media or "").strip().lower()
+    if not m:
+        return True
+    ok = True
+    for mm in re.finditer(r'(min|max)-(?:device-)?width\s*:\s*(\d+(?:\.\d+)?)\s*px', m):
+        bound, val = mm.group(1), float(mm.group(2))
+        if bound == "min" and viewport_w < val:
+            ok = False
+        elif bound == "max" and viewport_w > val:
+            ok = False
+    return ok
+
+
+def _source_type_ok(type_str: str) -> bool:
+    """Czy potrafimy zdekodować typ <source type>? Odrzucamy znane nierenderowalne
+    (SVG, AVIF); pusty/nieznany akceptujemy (próbujemy — błąd skończy się alt)."""
+    t = (type_str or "").strip().lower()
+    if not t:
+        return True
+    return ("svg" not in t) and ("avif" not in t)
+
+
+def _pick_picture_src(node, base_url: str, viewport_w: int) -> str:
+    """Rozwiązuje adres dla <picture>: pierwszy <source> pasujący typem i media,
+    z największym wariantem rastrowym srcset; w razie braku — wewnętrzny <img>
+    (przez zwykłe _pick_image_src). Zwraca '' gdy nie ma żadnego źródła."""
+    img_attrs = None
+    for child in getattr(node, "children", []) or []:
+        ctag = (getattr(child, "tag", "") or "").lower()
+        if ctag == "source":
+            a = getattr(child, "attrs", {}) or {}
+            if not _source_type_ok(a.get("type", "")):
+                continue
+            media = a.get("media", "")
+            if media and not _media_matches(media, viewport_w):
+                continue
+            srcset = a.get("srcset") or a.get("data-srcset")
+            if srcset:
+                cands = _parse_srcset(srcset, base_url)
+                raster = [c for c in cands if not _is_svg(c[0])]
+                pool = raster if raster else cands
+                if pool:
+                    pool.sort(key=lambda c: c[1], reverse=True)
+                    return pool[0][0]
+            raw = a.get("src") or a.get("data-src")
+            if raw and raw.strip():
+                return urllib.parse.urljoin(base_url, raw.strip())
+        elif ctag == "img" and img_attrs is None:
+            img_attrs = getattr(child, "attrs", {}) or {}
+    if img_attrs is not None:
+        return _pick_image_src(img_attrs, base_url)
+    return ""
+
+
 # ─── 1. STRUKTURY DANYCH (Visual Box Tree) ──────────────────────────────────
 class LayoutBox:
-    __slots__ = ['rect', 'text', 'color', 'node', 'box_type']
-    def __init__(self, rect, text, color, node=None, box_type="text"):
+    __slots__ = ['rect', 'text', 'color', 'node', 'box_type', 'style', 'meta']
+    def __init__(self, rect, text, color, node=None, box_type="text", style=STYLE_NONE, meta=None):
         self.rect = rect
         self.text = text
         self.color = color
         self.node = node
         self.box_type = box_type
+        self.style = style
+        self.meta = meta
 
 
 # ─── 2. SILNIK UKŁADU (Iteracyjny DFS z przepływem Inline) ──────────────────
 class LayoutEngine:
-    def __init__(self, max_w: int, char_w: int, line_h: int):
+    def __init__(self, max_w: int, char_w: int, line_h: int, image_loader=None, base_url=""):
         self.max_w = max_w
         self.char_w = char_w
         self.line_h = line_h
+        self.image_loader = image_loader
+        self.base_url = base_url or ""
 
     def build(self, root_node, start_x: int, start_y: int):
         boxes = []
-        stack = [(root_node, 0, False)]
+        # Krotka stosu: (węzeł, wcięcie, czy_post, styl_odziedziczony, form)
+        # form = najbliższy przodek <form> (SemanticNode) albo None.
+        stack = [(root_node, 0, False, STYLE_NONE, None)]
         current_y = start_y
         current_x = start_x
 
@@ -79,10 +313,13 @@ class LayoutEngine:
                 current_x = start_x + indent
                 current_y += self.line_h
 
-        def add_text_chunk(text, color, node, btype, indent):
+        def add_text_chunk(text, color, node, btype, indent, style=STYLE_NONE):
             nonlocal current_x, current_y
             words = text.replace('\n', ' ').split(' ')
             for w in words:
+                if not w:
+                    continue
+                w = w.translate(_ZW_TABLE)   # usuń znaki zerowej szerokości
                 if not w:
                     continue
                 w_len = len(w) * self.char_w
@@ -90,11 +327,162 @@ class LayoutEngine:
                 if current_x + w_len > start_x + self.max_w - indent and current_x > start_x + indent:
                     flush_line(indent)
                 r = pygame.Rect(current_x, current_y, w_len, self.line_h)
-                boxes.append(LayoutBox(r, w, color, node, btype))
+                boxes.append(LayoutBox(r, w, color, node, btype, style))
                 current_x += w_len + self.char_w
 
+        def add_field(node, kind, form, indent):
+            nonlocal current_x, current_y
+            attrs = getattr(node, "attrs", {}) or {}
+
+            # Ukryte pole — nie rysujemy, ale bierze udział w wysyłce.
+            if kind == "hidden":
+                node.attrs.setdefault("value", attrs.get("value", ""))
+                r = pygame.Rect(current_x, current_y, 0, 0)
+                boxes.append(LayoutBox(r, "", (0, 0, 0), node, "hidden_field",
+                                       STYLE_NONE, {"form": form, "kind": kind}))
+                return
+
+            # Textarea — traktujemy jak blok: własna linia, pełna szerokość, 3 wiersze.
+            if kind == "textarea":
+                flush_line(indent)
+                node.attrs.setdefault("value", node.get_plain_text())
+                w = max(self.char_w * 8, self.max_w - indent)
+                h = self.line_h * 3 + 6
+                r = pygame.Rect(start_x + indent, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (210, 210, 210), node, "textarea",
+                                       STYLE_NONE, {"form": form, "kind": kind}))
+                current_y += h + 4
+                current_x = start_x + indent
+                return
+
+            # Checkbox / radio — mały kwadrat / koło, stan w _checked.
+            if kind in ("checkbox", "radio"):
+                node.attrs.setdefault("_checked", "checked" in attrs)
+                w = self.line_h
+                h = self.line_h
+                if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
+                    flush_line(indent)
+                r = pygame.Rect(current_x, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (210, 210, 210), node, kind,
+                                       STYLE_NONE, {"form": form, "kind": kind}))
+                current_x += w + self.char_w
+                return
+
+            # Select — lista opcji; w v1 wybór cyklicznie klikiem (bez popupu).
+            if kind == "select":
+                opts, sel = _gather_options(node)
+                node.attrs.setdefault("_selected", sel if sel >= 0 else 0)
+                cur_label = opts[node.attrs["_selected"]][1] if (opts and 0 <= node.attrs["_selected"] < len(opts)) else "—"
+                label = cur_label + "  ▾"
+                w = min(max(6, len(label) + 2) * self.char_w, self.max_w - indent)
+                h = self.line_h
+                if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
+                    flush_line(indent)
+                r = pygame.Rect(current_x, current_y, w, h)
+                boxes.append(LayoutBox(r, label, (225, 225, 235), node, "select",
+                                       STYLE_NONE, {"form": form, "kind": "select", "options": opts}))
+                current_x += w + self.char_w
+                return
+
+            # Przyciski — szerokość wg etykiety.
+            if kind in ("submit", "button"):
+                default_label = {"submit": "Wyślij", "button": "OK"}[kind]
+                label = (attrs.get("value") or node.get_plain_text() or default_label).strip()
+                w = max(4, len(label) + 2) * self.char_w
+                btype = "button"
+            else:
+                # Pole tekstowe / hasło.
+                node.attrs.setdefault("value", attrs.get("value", ""))
+                try:
+                    size = int(attrs.get("size", ""))
+                except (TypeError, ValueError):
+                    size = 0
+                cols = size if size > 0 else 24
+                w = cols * self.char_w
+                label = ""
+                btype = "input"
+
+            w = min(w, self.max_w - indent)
+            h = self.line_h
+            # Zawijanie inline jak dla słowa.
+            if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
+                flush_line(indent)
+            r = pygame.Rect(current_x, current_y, w, h)
+            boxes.append(LayoutBox(r, label, (210, 210, 210), node, btype,
+                                   STYLE_NONE, {"form": form, "kind": kind}))
+            current_x += w + self.char_w
+
+        def add_image(node, indent, src_override=None):
+            nonlocal current_x, current_y
+            attrs = getattr(node, "attrs", {}) or {}
+            # Wybór adresu: lazy-load (data-src/srcset) i największy wariant rastrowy
+            # przed surowym src; src bywa przy lazy-loadzie placeholderem 1x1.
+            # src_override (z <picture>) ma pierwszeństwo, gdy podany.
+            src = src_override if src_override is not None else _pick_image_src(attrs, self.base_url)
+            alt = attrs.get("alt", "") or ""
+
+            def _px(v):
+                try:
+                    return int(str(v).strip().lower().replace("px", ""))
+                except (TypeError, ValueError):
+                    return 0
+
+            aw, ah = _px(attrs.get("width")), _px(attrs.get("height"))
+            iw = ih = 0
+            if self.image_loader is not None and src:
+                isz = self.image_loader.intrinsic_size(src)
+                if isz:
+                    iw, ih = isz
+
+            # Rozmiar docelowy: atrybuty > realne wymiary > placeholder 16:9.
+            if aw and ah:
+                w, h = aw, ah
+            elif iw and ih:
+                if aw:
+                    w, h = aw, max(1, round(aw * ih / iw))
+                elif ah:
+                    h, w = ah, max(1, round(ah * iw / ih))
+                else:
+                    w, h = iw, ih
+            else:
+                w = aw or 320
+                h = ah or max(1, round(w * 9 / 16))
+
+            avail = self.max_w - indent
+            if w > avail and w > 0:
+                h = max(1, round(h * avail / w))
+                w = avail
+
+            meta = {"src": src, "alt": alt}
+            # Małe obrazy płyną inline (ikony); duże zachowują się jak blok.
+            if h <= self.line_h:
+                if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
+                    flush_line(indent)
+                r = pygame.Rect(current_x, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (60, 60, 75), node, "image", STYLE_NONE, meta))
+                current_x += w + self.char_w
+            else:
+                flush_line(indent)
+                r = pygame.Rect(start_x + indent, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (60, 60, 75), node, "image", STYLE_NONE, meta))
+                current_y += h + 4
+                current_x = start_x + indent
+
+        def add_picture(node, indent):
+            # <picture>: wybierz adres z rodzeństwa <source> (media/type) lub
+            # z wewnętrznego <img>; wyemituj JEDNO pudełko obrazu (wymiary/alt z
+            # <img>, jeśli jest). Nie schodzimy potem w dzieci picture.
+            inner_img = None
+            for child in getattr(node, "children", []) or []:
+                if (getattr(child, "tag", "") or "").lower() == "img":
+                    inner_img = child
+                    break
+            resolved = _pick_picture_src(node, self.base_url, self.max_w)
+            target = inner_img if inner_img is not None else node
+            add_image(target, indent, src_override=resolved)
+
         while stack:
-            node, indent, is_post = stack.pop()
+            node, indent, is_post, style, form = stack.pop()
             
             is_block = node.typ in (NodeType.BLOCK, NodeType.LIST, NodeType.PRE, NodeType.TABLE, NodeType.HR)
             
@@ -110,25 +498,35 @@ class LayoutEngine:
                 flush_line(indent)
                 
             typ = node.typ
+            tag = getattr(node, "tag", "")
+            
+            # Czy to renderowane pole formularza? (przesądza też o NIE schodzeniu w dzieci)
+            is_field = False
+            field_kind = None
+            if typ == NodeType.INLINE and tag in _FIELD_TAGS:
+                field_kind = _field_kind(node)
+                is_field = field_kind is not None
+            is_image = (typ == NodeType.INLINE and tag == "img")
+            is_picture = (typ == NodeType.INLINE and tag == "picture")
             
             if typ == NodeType.TEXT:
                 text = (node.text or "").strip()
                 if text:
-                    add_text_chunk(text, (230, 230, 230), node, "text", indent)
+                    add_text_chunk(text, (230, 230, 230), node, "text", indent, style)
                     
             elif typ == NodeType.HEADING:
                 flush_line(indent)
                 current_y += self.line_h // 2
                 text = node.get_plain_text().strip()
                 if text:
-                    add_text_chunk(text, (255, 195, 90), node, "heading", indent)
+                    add_text_chunk(text, (255, 195, 90), node, "heading", indent, style)
                 flush_line(indent)
                 current_y += self.line_h // 4
                 
             elif typ == NodeType.LINK:
                 text = node.get_plain_text().strip()
                 if text:
-                    add_text_chunk(text, (90, 165, 255), node, "link", indent)
+                    add_text_chunk(text, (90, 165, 255), node, "link", indent, style)
                     
             elif typ == NodeType.HR:
                 flush_line(indent)
@@ -137,12 +535,27 @@ class LayoutEngine:
                 boxes.append(LayoutBox(r, "", (80, 80, 95), node, "hr"))
                 current_y += self.line_h // 2
                 
+            elif is_field:
+                add_field(node, field_kind, form, indent)
+                
+            elif is_image:
+                add_image(node, indent)
+
+            elif is_picture:
+                add_picture(node, indent)
+                
             next_indent = indent + (20 if typ == NodeType.LIST else 0)
+            # Styl spływa w dół: węzeł INLINE <b>/<i> dokłada swój bit potomkom.
+            child_style = style | _inline_style_bits(node)
+            # Kontekst formularza: wejście w <form> ustawia go dla potomków.
+            child_form = node if (typ == NodeType.INLINE and tag == "form") else form
             
-            stack.append((node, indent, True))
-            for child in reversed(node.children):
-                if typ not in (NodeType.LINK, NodeType.HEADING):
-                    stack.append((child, next_indent, False))
+            stack.append((node, indent, True, style, form))
+            # Nie schodzimy w dzieci LINK/HEADING (tekst brany przez get_plain_text),
+            # pól, obrazów ani <picture> (zawartość już skonsumowana).
+            if typ not in (NodeType.LINK, NodeType.HEADING) and not is_field and not is_image and not is_picture:
+                for child in reversed(node.children):
+                    stack.append((child, next_indent, False, child_style, child_form))
                     
         flush_line(0)
         return boxes, current_y
@@ -150,20 +563,54 @@ class LayoutEngine:
 
 # ─── 3. RENDERER DOM Z CACHE FONTÓW I CULLINGIEM ───────────────────────────
 class DOMRenderer:
-    def __init__(self, font):
+    def __init__(self, font, fonts=None, bold_via_color=True):
+        # font: czcionka bazowa (fallback dla każdego stylu).
+        # fonts: opcjonalny słownik {"regular","bold","italic","bold_italic"}.
+        #        Gdy None, każdy styl używa czcionki bazowej (zachowanie sprzed
+        #        formatowania — nic się nie psuje, jeśli display nie poda wariantów).
+        # bold_via_color: gdy True, <b>/<strong> wyróżniamy jaśniejszym kolorem,
+        #        bo baza monospace jest już bold i nie ma cięższego wariantu.
         self.font = font
+        self.fonts = fonts or {}
+        self.bold_via_color = bold_via_color
         self.font_cache = {}
 
-    def _get_text_surface(self, text: str, color: tuple):
-        key = (text, color)
+    def _font_for(self, style: int):
+        if not self.fonts:
+            return self.font
+        bold = bool(style & STYLE_BOLD)
+        ital = bool(style & STYLE_ITALIC)
+        if bold and ital:
+            return self.fonts.get("bold_italic") or self.fonts.get("italic") or self.font
+        if ital:
+            return self.fonts.get("italic") or self.font
+        if bold:
+            return self.fonts.get("bold") or self.font
+        return self.fonts.get("regular") or self.font
+
+    @staticmethod
+    def _render_text(font, text, color):
+        """Render odporny na pygame-ce: render('' lub znaku zerowej szerokości)
+        rzuca 'Text has zero width'. W takim wypadku zwracamy 1×h przezroczystą
+        powierzchnię zamiast wywracać całą pętlę renderu."""
+        import pygame
+        try:
+            return font.render(text, True, color)
+        except pygame.error:
+            return pygame.Surface((1, max(1, font.get_height())), pygame.SRCALPHA)
+
+    def _get_text_surface(self, text: str, color: tuple, style: int = STYLE_NONE):
+        # Klucz cache obejmuje styl — inaczej bold/italic kolidowałyby z regular.
+        key = (text, color, style)
         if key not in self.font_cache:
-            self.font_cache[key] = self.font.render(text, True, color)
+            self.font_cache[key] = self._render_text(self._font_for(style), text, color)
         return self.font_cache[key]
 
-    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect, hovered_box=None):
+    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect, hovered_box=None, focused_box=None, image_loader=None):
         import pygame
         old_clip = ctx.surface.get_clip()
         ctx.surface.set_clip(clip_rect)
+        blink_on = (pygame.time.get_ticks() // 500) % 2 == 0
         
         for box in boxes:
             box_y = box.rect.y - scroll_y
@@ -173,25 +620,25 @@ class DOMRenderer:
             if box_y > clip_rect.bottom:
                 break
             
-            # Poświata pod kursorem — rozjaśniamy kolor o stałą wartość,
-            # z nasyceniem na 255. Bazowy box.color pozostaje nietknięty.
+            # Kolor: najpierw ewentualne wyróżnienie bold (jaśniej), potem
+            # poświata pod kursorem. Bazowy box.color pozostaje nietknięty.
             draw_color = box.color
+            if self.bold_via_color and (box.style & STYLE_BOLD):
+                draw_color = _brighten(draw_color, 35)
             if hovered_box is not None and box is hovered_box:
-                draw_color = (
-                    min(255, box.color[0] + 80),
-                    min(255, box.color[1] + 80),
-                    min(255, box.color[2] + 80),
-                )
+                draw_color = _brighten(draw_color, 80)
                 
             if box.box_type in ("text", "heading", "link"):
-                surf = self._get_text_surface(box.text, draw_color)
+                surf = self._get_text_surface(box.text, draw_color, box.style)
                 ctx.surface.blit(surf, (box.rect.x, box_y))
                 
                 if box.box_type == "link":
+                    # Podkreślenie liczymy z wysokości użytej czcionki wariantu.
+                    line_y = box_y + self._font_for(box.style).get_height()
                     pygame.draw.line(
                         ctx.surface, draw_color,
-                        (box.rect.x, box_y + self.font.get_height()),
-                        (box.rect.x + surf.get_width(), box_y + self.font.get_height())
+                        (box.rect.x, line_y),
+                        (box.rect.x + surf.get_width(), line_y)
                     )
 
             elif box.box_type == "hr":
@@ -200,8 +647,152 @@ class DOMRenderer:
                     (box.rect.x, box_y), 
                     (box.rect.x + box.rect.w, box_y)
                 )
-                                 
+
+            elif box.box_type in ("input", "textarea", "button", "select", "checkbox", "radio"):
+                focused = (focused_box is not None and box is focused_box)
+                self._draw_field(ctx, box, box_y, focused, blink_on)
+
+            elif box.box_type == "image":
+                self._draw_image(ctx, box, box_y, image_loader)
+            # box_type == "hidden_field" -> nic nie rysujemy
+
         ctx.surface.set_clip(old_clip)
+
+    def _draw_field(self, ctx, box, box_y, focused, blink_on):
+        import pygame
+        kind = box.meta.get("kind") if box.meta else ""
+        rect = pygame.Rect(box.rect.x, box_y, box.rect.w, box.rect.h)
+        font = self._font_for(STYLE_NONE)
+        attrs = getattr(box.node, "attrs", {}) if box.node else {}
+
+        # Checkbox / radio — wskaźnik stanu.
+        if box.box_type in ("checkbox", "radio"):
+            checked = bool(attrs.get("_checked"))
+            outline = (120, 200, 255) if focused else (150, 150, 170)
+            pad = 3
+            inner = pygame.Rect(rect.x + pad, rect.y + pad, rect.h - 2 * pad, rect.h - 2 * pad)
+            if box.box_type == "checkbox":
+                pygame.draw.rect(ctx.surface, (22, 22, 32), inner, 0, 2)
+                pygame.draw.rect(ctx.surface, outline, inner, 1, 2)
+                if checked:
+                    x, y, w, h = inner.x, inner.y, inner.w, inner.h
+                    pygame.draw.lines(ctx.surface, (120, 220, 150), False,
+                                      [(x + 3, int(y + h * 0.55)),
+                                       (int(x + w * 0.42), y + h - 3),
+                                       (x + w - 2, y + 2)], 2)
+            else:
+                cx, cy = inner.center
+                rad = inner.w // 2
+                pygame.draw.circle(ctx.surface, (22, 22, 32), (cx, cy), rad)
+                pygame.draw.circle(ctx.surface, outline, (cx, cy), rad, 1)
+                if checked:
+                    pygame.draw.circle(ctx.surface, (120, 200, 255), (cx, cy), max(2, rad - 3))
+            return
+
+        # Select — pudełko z bieżącą etykietą i strzałką (czytane na żywo z węzła).
+        if box.box_type == "select":
+            opts = box.meta.get("options") if box.meta else []
+            idx = attrs.get("_selected", 0)
+            cur = opts[idx][1] if (opts and 0 <= idx < len(opts)) else "—"
+            fill    = (70, 70, 100) if focused else (40, 40, 60)
+            outline = (120, 200, 255) if focused else (90, 90, 120)
+            pygame.draw.rect(ctx.surface, fill, rect, 0, 4)
+            pygame.draw.rect(ctx.surface, outline, rect, 1, 4)
+            ls = self._render_text(font, cur + "  ▾", (225, 225, 235))
+            old = ctx.surface.get_clip()
+            ctx.surface.set_clip(rect)
+            ctx.surface.blit(ls, (rect.x + 6, rect.y + max(0, (rect.h - ls.get_height()) // 2)))
+            ctx.surface.set_clip(old)
+            return
+
+        # Przycisk submit/zwykły — wypełnione pudełko z wyśrodkowaną etykietą.
+        if box.box_type == "button":
+            fill    = (70, 70, 100) if focused else (40, 40, 60)
+            outline = (120, 200, 255) if focused else (90, 90, 120)
+            pygame.draw.rect(ctx.surface, fill, rect, 0, 4)
+            pygame.draw.rect(ctx.surface, outline, rect, 1, 4)
+            ls = self._render_text(font, box.text, (225, 225, 235))
+            ctx.surface.blit(ls, (rect.x + max(4, (rect.w - ls.get_width()) // 2),
+                                  rect.y + max(0, (rect.h - ls.get_height()) // 2)))
+            return
+
+        # Pola edytowalne (input / textarea) — ramka, wartość, kursor.
+        outline = (120, 200, 255) if focused else (70, 70, 95)
+        pygame.draw.rect(ctx.surface, (22, 22, 32), rect, 0, 3)
+        pygame.draw.rect(ctx.surface, outline, rect, 1, 3)
+
+        val = attrs.get("value", "")
+        if kind == "password":
+            shown = "•" * len(val)
+            color = (235, 235, 240)
+        elif val:
+            shown = val
+            color = (235, 235, 240)
+        elif focused:
+            shown = ""
+            color = (235, 235, 240)
+        else:
+            shown = attrs.get("placeholder", "")
+            color = (110, 110, 125)
+
+        pad = 6
+        inner = pygame.Rect(rect.x + pad, rect.y, rect.w - 2 * pad, rect.h)
+        old = ctx.surface.get_clip()
+        ctx.surface.set_clip(inner)
+
+        ty = rect.y + max(0, (self.line_height_hint() - font.get_height()) // 2)
+        ts = self._render_text(font, shown, color)
+        tw = ts.get_width()
+        caret_w = font.size("|")[0]
+        # Przewijanie poziome, by koniec tekstu (kursor) był widoczny w polu skupionym.
+        shift = max(0, tw - (inner.w - caret_w - 2)) if focused else 0
+        ctx.surface.blit(ts, (inner.x - shift, ty))
+        if focused and blink_on:
+            cs = self._render_text(font, "|", (235, 235, 240))
+            ctx.surface.blit(cs, (inner.x - shift + tw, ty))
+
+        ctx.surface.set_clip(old)
+
+    def line_height_hint(self):
+        # Wysokość pojedynczego wiersza tekstu (do pionowego centrowania w polach).
+        return self._font_for(STYLE_NONE).get_height() + 2
+
+    def _draw_image(self, ctx, box, box_y, loader):
+        import pygame
+        rect = pygame.Rect(box.rect.x, box_y, box.rect.w, box.rect.h)
+        meta = box.meta or {}
+        src = meta.get("src", "")
+        alt = meta.get("alt", "")
+
+        surf, status = (None, "empty")
+        if loader is not None and src:
+            surf, status = loader.get(src, box.rect.w, box.rect.h)
+
+        if surf is not None:
+            ctx.surface.blit(surf, (rect.x, rect.y))
+            return
+
+        # Placeholder / ładowanie / błąd — ramka + tekst alt.
+        pygame.draw.rect(ctx.surface, (28, 28, 38), rect, 0, 3)
+        border = (120, 60, 60) if status == "error" else (70, 70, 95)
+        pygame.draw.rect(ctx.surface, border, rect, 1, 3)
+
+        font = self._font_for(STYLE_NONE)
+        if status == "error":
+            label = "✕ " + (alt or "obraz")
+            col = (200, 120, 120)
+        elif status == "loading":
+            label = "… " + (alt or "ładowanie")
+            col = (140, 140, 160)
+        else:
+            label = alt or "obraz"
+            col = (120, 120, 140)
+
+        old = ctx.surface.get_clip()
+        ctx.surface.set_clip(rect)
+        ls = self._render_text(font, label, col)
+        ctx.surface.blit(ls, (rect.x + 6, rect.y + max(0, (rect.h - ls.get_height()) // 2)))
+        ctx.surface.set_clip(old)
 
 
 # ─── 4. ADAPTER WIDOKU (GraphicPageViewer) ──────────────────────────────────
@@ -235,6 +826,19 @@ class GraphicPageViewer:
         self.heat_repeat_ms = 400        # min. odstęp ponownego podgrzania TEGO SAMEGO węzła
         self.hover_weight = 1.0          # siła sygnału uwagi (świadomie nie 2.0 — patrz uwagi)
 
+        # ── Stan formularzy ──────────────────────────────────────────────
+        self.focused_field = None        # LayoutBox pola z focusem (input/textarea) albo None
+        self._post_pending = None        # (target, pary) gdy method=POST — v2 to obsłuży
+
+        # ── Stan grafiki (E1) ────────────────────────────────────────────
+        self._images_dirty = False       # obraz się zdekodował -> przelicz layout
+        self._js_dirty = False           # JS zmutował DOM -> przelicz layout (Szew B)
+        try:
+            rt = getattr(self.browser, "runtime", None)
+            self.image_loader = ImageLoader(runtime=rt) if _HAS_IMAGES else None
+        except Exception:
+            self.image_loader = None
+
     def wants_keys(self):
         return True
 
@@ -253,6 +857,12 @@ class GraphicPageViewer:
                 self.url_text += event.unicode
             return True
 
+        # Pole formularza z focusem przechwytuje edycję; klawisze nieobsłużone
+        # (np. strzałki) przepuszczamy niżej do obsługi scrolla.
+        if self.focused_field is not None:
+            if self._field_key(event):
+                return True
+
         if event.key == pygame.K_UP:
             self.scroll_y = max(0, self.scroll_y - 40)
         elif event.key == pygame.K_DOWN:
@@ -264,6 +874,110 @@ class GraphicPageViewer:
         elif event.key == pygame.K_ESCAPE:
             self.close_callback()
             
+        return True
+
+    # ── FORMULARZE: edycja pola z focusem ────────────────────────────────
+    def _field_key(self, event) -> bool:
+        """Obsługuje klawisz dla pola z focusem. Zwraca True, gdy skonsumowano."""
+        import pygame
+        box = self.focused_field
+        if box is None or box.box_type not in ("input", "textarea") or box.node is None:
+            return False
+        val = box.node.attrs.get("value", "")
+        if event.key == pygame.K_RETURN:
+            # Enter zatwierdza formularz (v1: także w textarea — multiline w v2).
+            self._submit_form(box)
+            return True
+        if event.key == pygame.K_BACKSPACE:
+            box.node.attrs["value"] = val[:-1]
+            return True
+        if event.key == pygame.K_ESCAPE:
+            self.focused_field = None
+            return True
+        if event.key == pygame.K_TAB:
+            self._focus_next_field()
+            return True
+        if event.unicode and event.unicode.isprintable():
+            box.node.attrs["value"] = val + event.unicode
+            return True
+        return False
+
+    def _focus_next_field(self):
+        """Przenosi focus na kolejne pole edytowalne (Tab), z zawijaniem."""
+        fields = [b for b in self.layout_boxes if b.box_type in ("input", "textarea")]
+        if not fields:
+            self.focused_field = None
+            return
+        if self.focused_field in fields:
+            i = fields.index(self.focused_field)
+            self.focused_field = fields[(i + 1) % len(fields)]
+        else:
+            self.focused_field = fields[0]
+
+    def _submit_form(self, trigger_box) -> bool:
+        """Zbiera pola tego samego formularza, buduje dane i wysyła.
+
+        GET -> query doklejony do action. POST -> browser.post (jeśli dostępny;
+        starszy browser bez POST zapisuje zamiar w self._post_pending).
+        Reguły pól: checkbox/radio wchodzą tylko gdy zaznaczone; select wnosi
+        wartość wybranej opcji; pola bez atrybutu name są pomijane.
+        """
+        form = trigger_box.meta.get("form") if trigger_box.meta else None
+
+        pairs = []
+        for b in self.layout_boxes:
+            bt = b.box_type
+            if bt not in ("input", "textarea", "hidden_field", "checkbox", "radio", "select"):
+                continue
+            if (b.meta.get("form") if b.meta else None) is not form:
+                continue
+            if b.node is None:
+                continue
+            name = b.node.attrs.get("name")
+            if not name:
+                continue
+            if bt in ("checkbox", "radio"):
+                if b.node.attrs.get("_checked"):
+                    pairs.append((name, b.node.attrs.get("value", "on")))
+            elif bt == "select":
+                opts = b.meta.get("options") if b.meta else []
+                idx = b.node.attrs.get("_selected", 0)
+                if opts and 0 <= idx < len(opts):
+                    pairs.append((name, opts[idx][0]))
+            else:
+                pairs.append((name, b.node.attrs.get("value", "")))
+
+        # Para name=value przycisku submit — tylko gdy wyzwalaczem był przycisk
+        # (pole tekstowe jest już policzone w pętli powyżej; inaczej duplikat).
+        if trigger_box.box_type == "button" and trigger_box.node is not None:
+            sname = trigger_box.node.attrs.get("name")
+            if sname:
+                pairs.append((sname, trigger_box.node.attrs.get("value", "")))
+
+        page = getattr(self.browser, "_current", None)
+        base = page.url if page else ""
+        action = (form.attrs.get("action") if form is not None else "") or ""
+        method = (form.attrs.get("method", "get") if form is not None else "get").lower()
+        target = urllib.parse.urljoin(base, action) if action else base
+        if not target:
+            return False
+
+        if method == "post":
+            poster = getattr(self.browser, "post", None)
+            if callable(poster):
+                self.focused_field = None
+                poster(target, pairs)
+                return True
+            # Starszy browser bez POST — zachowujemy dotychczasowy fallback.
+            self._post_pending = (target, pairs)
+            return False
+
+        query = urllib.parse.urlencode(pairs)
+        if query:
+            sep = "&" if ("?" in target) else "?"
+            target = target + sep + query
+        self.focused_field = None
+        self.browser.go(target)
         return True
 
     def on_mouse(self, event, rect):
@@ -285,12 +999,15 @@ class GraphicPageViewer:
                     
                 if self.input_url_rect and self.input_url_rect.collidepoint(mx, my):
                     self.url_active = True
+                    self.focused_field = None
                     page = getattr(self.browser, "_current", None)
                     if not self.url_text and page:
                         self.url_text = page.url
                     return True
                 else:
                     self.url_active = False
+                    # Klik poza polem odfocusowuje; pętla niżej może focus przywrócić.
+                    self.focused_field = None
 
                 current_page = getattr(self.browser, "_current", None)
                 if not current_page:
@@ -304,6 +1021,29 @@ class GraphicPageViewer:
                     if hit_rect.top > rect.bottom:
                         break
                         
+                    if box.box_type in ("input", "textarea") and hit_rect.collidepoint(mx, my):
+                        self.focused_field = box
+                        return True
+                        
+                    if box.box_type == "checkbox" and hit_rect.collidepoint(mx, my):
+                        if box.node is not None:
+                            box.node.attrs["_checked"] = not bool(box.node.attrs.get("_checked"))
+                        return True
+                        
+                    if box.box_type == "radio" and hit_rect.collidepoint(mx, my):
+                        self._select_radio(box)
+                        return True
+                        
+                    if box.box_type == "select" and hit_rect.collidepoint(mx, my):
+                        self._cycle_select(box)
+                        return True
+                        
+                    if box.box_type == "button" and hit_rect.collidepoint(mx, my):
+                        kind = box.meta.get("kind") if box.meta else ""
+                        if kind == "submit":
+                            self._submit_form(box)
+                        return True
+                        
                     if box.box_type == "link" and hit_rect.collidepoint(mx, my):
                         href = box.node.attrs.get('href') if box.node else None
                         if href:
@@ -311,6 +1051,31 @@ class GraphicPageViewer:
                             self.browser.go(target_url)
                         return True
         return False
+
+    # ── FORMULARZE: stan checkbox / radio / select ───────────────────────
+    def _select_radio(self, box):
+        """Zaznacza ten radio i odznacza pozostałe w tej samej grupie (form+name)."""
+        node = box.node
+        if node is None:
+            return
+        form = box.meta.get("form") if box.meta else None
+        name = node.attrs.get("name")
+        for b in self.layout_boxes:
+            if b.box_type != "radio" or b.node is None:
+                continue
+            if (b.meta.get("form") if b.meta else None) is not form:
+                continue
+            if b.node.attrs.get("name") != name:
+                continue
+            b.node.attrs["_checked"] = (b is box)
+
+    def _cycle_select(self, box):
+        """Przełącza wybór <select> na kolejną opcję (klik), z zawijaniem."""
+        opts = box.meta.get("options") if box.meta else []
+        if not opts or box.node is None:
+            return
+        idx = box.node.attrs.get("_selected", 0)
+        box.node.attrs["_selected"] = (idx + 1) % len(opts)
 
     # ── HOVER-HEAT: detekcja (czysta) ────────────────────────────────────
     def _find_hovered_box(self, mx: int, my: int, top_limit: int, bottom_limit: int):
@@ -397,20 +1162,25 @@ class GraphicPageViewer:
 
     def _rebuild_layout_if_needed(self, ctx: DrawCtx, page):
         version = getattr(self.browser, '_dom_version', 0)
-        if page.url == self.last_page_url and version == self.last_dom_version:
+        page_changed = (page.url != self.last_page_url or version != self.last_dom_version)
+        if not page_changed and not self._images_dirty and not self._js_dirty:
             return
 
         if self.dom_renderer is None:
-            self.dom_renderer = DOMRenderer(ctx.font)
+            self.dom_renderer = DOMRenderer(ctx.font, getattr(ctx, "fonts", None), bold_via_color=False)
 
         self.last_page_url = page.url
         self.last_dom_version = version
-        self.scroll_y = 0
+        self._images_dirty = False
+        self._js_dirty = False
 
-        # Nowa strona/wersja DOM — reset stanu hover-heat, by stare
-        # referencje węzłów nie blokowały podgrzania na nowym drzewie.
-        self.hovered_box = None
-        self._last_heated_node = None
+        # Reset scrolla/hoveru/focusu TYLKO przy zmianie strony; przebudowa
+        # wywołana zdekodowaniem obrazu zachowuje pozycję i stan.
+        if page_changed:
+            self.scroll_y = 0
+            self.hovered_box = None
+            self._last_heated_node = None
+            self.focused_field = None
 
         tree = getattr(page, "semantic_tree", None)
         if not tree:
@@ -423,12 +1193,23 @@ class GraphicPageViewer:
         max_w = ctx.rect.w - 80
         char_w = max(1, ctx.font.size("A")[0])
         
-        engine = LayoutEngine(max_w, char_w, ctx._line_h)
+        engine = LayoutEngine(max_w, char_w, ctx._line_h,
+                              image_loader=self.image_loader, base_url=page.url)
         self.layout_boxes, max_y = engine.build(tree, cx, start_y)
+
+        # Zleć pobranie wszystkich obrazów strony (src już absolutny po add_image).
+        if self.image_loader is not None:
+            for b in self.layout_boxes:
+                if b.box_type == "image" and b.meta:
+                    src = b.meta.get("src", "")
+                    if src:
+                        self.image_loader.request(src)
         
         view_h = ctx.rect.h - self.nav_h
         content_h = max_y - start_y
         self.max_scroll = max(0, content_h - view_h + 50)
+        # Po przeliczeniu (np. obrazy zmieniły wysokości) utrzymaj scroll w zakresie.
+        self.scroll_y = max(0, min(self.scroll_y, self.max_scroll))
 
     def _draw_all(self, ctx: DrawCtx):
         import pygame
@@ -469,7 +1250,39 @@ class GraphicPageViewer:
             ctx.text("Wciskając ESC, w każdej chwili powrócisz do konsoli systemowej.", (100, 100, 100), x=ctx.rect.x + 40, y=ctx.rect.y + self.nav_h + 95)
             return
 
+        # ── SZEW B: pompuj pętlę JS co klatkę; mutacje DOM -> przelicz layout ──
+        jsb = getattr(self.browser, "js_bridge", None)
+        if jsb is not None and getattr(jsb, "_active", False):
+            pump = getattr(jsb, "pump_and_sync", None)
+            if callable(pump):
+                try:
+                    if pump():
+                        self._js_dirty = True
+                except Exception:
+                    pass
+
+        # Odbierz świeżo zdekodowane obrazy; jeśli dotyczą bieżącej strony,
+        # oznacz layout do przeliczenia (intrinsic -> właściwe wymiary pudełek).
+        if self.image_loader is not None:
+            changed = self.image_loader.poll()
+            if changed:
+                srcs = {b.meta.get("src") for b in self.layout_boxes
+                        if b.box_type == "image" and b.meta}
+                if changed & srcs:
+                    self._images_dirty = True
+
         self._rebuild_layout_if_needed(ctx, page)
+
+        # ── E2: tekstury obecne w layoucie są osiągalne; reszta stygnie i jest
+        # żęta przez reach-GC substratu (zwalnia Surface). Robione po przebudowie,
+        # gdy layout_boxes jest aktualny dla bieżącej strony.
+        if self.image_loader is not None:
+            img_srcs = {b.meta.get("src") for b in self.layout_boxes
+                        if b.box_type == "image" and b.meta and b.meta.get("src")}
+            try:
+                self.image_loader.update_reach(img_srcs)
+            except Exception:
+                pass
         
         if not self.layout_boxes:
             ctx.text(f"Brak drzewa DOM dla: {page.title}", (255, 100, 100), x=ctx.rect.x + 40, y=ctx.rect.y + self.nav_h + 30)
@@ -483,7 +1296,8 @@ class GraphicPageViewer:
         self.hovered_box = self._find_hovered_box(mx, my, top_limit, clip_rect.bottom)
         self._apply_hover_heat(self.hovered_box, pygame.time.get_ticks())
 
-        self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect, self.hovered_box)
+        self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect,
+                               self.hovered_box, self.focused_field, self.image_loader)
 
 
 def show_help(term_state):

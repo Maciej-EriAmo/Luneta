@@ -196,11 +196,15 @@ class LogoState:
 
 # ─── DrawCtx ─────────────────────────────────────────────────────────────────
 class DrawCtx:
-    def __init__(self, surface: "pygame.Surface", font: "pygame.font.Font", rect: "pygame.Rect"):
+    def __init__(self, surface: "pygame.Surface", font: "pygame.font.Font", rect: "pygame.Rect", fonts=None):
         self.surface = surface
         self.font    = font
         self.rect    = rect
         self._line_h = font.get_height() + 2
+        # Opcjonalny zestaw wariantów {"regular","bold","italic","bold_italic"}
+        # wykorzystywany przez DOMRenderer Lunety. Gdy None — render używa
+        # pojedynczej czcionki bazowej (zachowanie sprzed formatowania).
+        self.fonts   = fonts
 
     def text(self, txt: str, color: Tuple[int,int,int] = C_FG,
              x: Optional[int] = None, y: Optional[int] = None) -> "pygame.Rect":
@@ -629,7 +633,7 @@ class ImmediateRenderer:
         self._t = 0.0
 
     def _make_ctx(self, rect):
-        return DrawCtx(self.screen, self.font, rect)
+        return DrawCtx(self.screen, self.font, rect, getattr(self, "fonts", None))
 
     def _get_atoms(self) -> List[Any]:
         if self.phi_ref is not None:
@@ -960,10 +964,39 @@ class KarmazynDisplay:
             except Exception:
                 font = pygame.font.Font(None, FONT_SIZE)
 
+            # Warianty czcionki dla TREŚCI przeglądarki (HUD i terminal nadal
+            # używają self._font = bold, więc ich wygląd się nie zmienia).
+            # Domyślnie ciało stron renderujemy REGULAR (bold wyłączony globalnie),
+            # dzięki czemu <b>/<strong> daje prawdziwy, cięższy kontrast wagi.
+            #   regular     -> waga normalna (ciało),
+            #   bold        -> prawdziwe pogrubienie (<b>/<strong>),
+            #   italic      -> pochylenie (<i>/<em>),
+            #   bold_italic -> pogrubienie + pochylenie (zagnieżdżone).
+            def _font_variant(bold: bool, italic: bool):
+                try:
+                    return pygame.font.SysFont("monospace", FONT_SIZE, bold=bold, italic=italic)
+                except Exception:
+                    vf = pygame.font.Font(None, FONT_SIZE)
+                    try:
+                        vf.set_bold(bold)
+                        vf.set_italic(italic)
+                    except Exception:
+                        pass
+                    return vf
+
+            font_variants = {
+                "regular":     _font_variant(False, False),
+                "bold":        _font_variant(True,  False),
+                "italic":      _font_variant(False, True),
+                "bold_italic": _font_variant(True,  True),
+            }
+
             self.logo_state.init_canvas(w // 2, h)
             self._screen   = screen
             self._font     = font
+            self._fonts    = font_variants
             self._renderer = ImmediateRenderer(screen, font, self.term_state, self.logo_state)
+            self._renderer.fonts = font_variants
             self._renderer.app_name = title
             self.available = True
             return True

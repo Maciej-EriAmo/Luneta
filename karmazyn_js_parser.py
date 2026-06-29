@@ -714,7 +714,10 @@ class JSParser:
     def _expr_stmt(self) -> tuple:
         e = self._expr()
         self._eat_semicolon()
-        if (isinstance(e, tuple) and len(e) >= 3 and e[0] == "_assign"):
+        # _make_assign zwraca 2-elementowy ("_assign", stmt). Rozpakowujemy go do
+        # samej instrukcji, żeby przypisania do membera/indeksu (setprop/setidx)
+        # trafiły do exec jako instrukcje, a nie wyciekały jako wyrażenie "expr".
+        if (isinstance(e, tuple) and len(e) >= 2 and e[0] == "_assign"):
             return e[1]
         return ("expr", e)
 

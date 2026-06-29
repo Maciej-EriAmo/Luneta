@@ -173,6 +173,7 @@ def install_async_engine(bridge,
     # ── attach: po stworzeniu VM podpinamy loop + async API + fetch ──────────
     def _attach(page):
         _orig_attach(page)
+        bridge._page = page          # potrzebne do write-backu LiveDOM → semantic_tree
         vm = bridge._vm
         if vm is None:
             return
@@ -191,8 +192,30 @@ def install_async_engine(bridge,
         bridge._async_loop = None
         _orig_detach()
 
-    # ── run_scripts: po skryptach auto-settle pętli ──────────────────────────
+    # ── SZEW A: write-back LiveDOM → semantic_tree ───────────────────────────
+    def _sync_dom_to_render():
+        """Jeśli JS zmutował DOM, przepisz LiveDOM na page.semantic_tree, żeby
+        renderer Lunety zobaczył zmiany. Zwraca True gdy drzewo podmieniono."""
+        doc  = getattr(bridge, "_doc", None)
+        page = getattr(bridge, "_page", None)
+        if doc is None or page is None:
+            return False
+        if not bridge.has_mutations():
+            return False
+        try:
+            from luneta_dom_sync import live_to_semantic
+            page.semantic_tree = live_to_semantic(doc)
+            bridge.reset_mutations()
+            return True
+        except Exception as e:
+            bridge._async_errors.append(f"sync_dom: {e}")
+            return False
+
+    # ── run_scripts: po skryptach auto-settle pętli + write-back ──────────────
     def _run_scripts(page):
+        # Mutacje z budowy mirrora (attach) nie są mutacjami JS — zerujemy je,
+        # żeby write-back odpalił TYLKO gdy skrypty realnie zmieniły DOM.
+        bridge.reset_mutations()
         result = _orig_run_scripts(page)
         loop = bridge._async_loop
         if loop is not None:
@@ -202,6 +225,9 @@ def install_async_engine(bridge,
             settled = loop.settle(max_ticks=settle_ticks)
             if isinstance(result, dict):
                 result["async_settled"] = settled
+        synced = _sync_dom_to_render()
+        if isinstance(result, dict):
+            result["dom_synced"] = synced
         return result
 
     # ── tick: pump pętli + oryginalny vm.tick() ──────────────────────────────
@@ -256,9 +282,24 @@ def install_async_engine(bridge,
         s["errors"] = list(bridge._async_errors[-5:])
         return s
 
-    bridge.pump       = _pump
-    bridge.run_loop   = _run_loop
-    bridge.loop_stats = _loop_stats
+    # ── SZEW B: pompowanie pętli co klatkę + write-back ──────────────────────
+    def _pump_and_sync(n: int = 1) -> bool:
+        """Wołane z pętli renderu co klatkę: przesuwa pętlę async i przepisuje
+        zmiany DOM na semantic_tree. Zwraca True gdy drzewo się zmieniło
+        (renderer powinien przebudować layout). Tanie, gdy brak pracy."""
+        loop = bridge._async_loop
+        if loop is not None:
+            for _ in range(max(1, n)):
+                if not loop._has_work():
+                    break
+                loop.tick()
+        return _sync_dom_to_render()
+
+    bridge.pump              = _pump
+    bridge.run_loop          = _run_loop
+    bridge.loop_stats        = _loop_stats
+    bridge.sync_dom_to_render = _sync_dom_to_render
+    bridge.pump_and_sync     = _pump_and_sync
 
 
 def install_async_engine_on_browser(browser, **kwargs) -> bool:

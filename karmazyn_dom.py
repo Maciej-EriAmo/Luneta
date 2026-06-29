@@ -94,6 +94,7 @@ class DOMMapper:
         self._page_holos:   Dict[str, str]       = {}
         self._page_bubbles: Dict[str, List[str]] = {}
         self._mapped_at:    Dict[str, float]     = {}
+        self._mapped_tree:  Dict[str, int]       = {}
 
     def map_page(self, page: Any) -> Optional[str]:
         url = page.url
@@ -104,7 +105,10 @@ class DOMMapper:
         if looks_like_decode_error(getattr(page, "title", "") or ""): return None
 
         mapped_at = self._mapped_at.get(url, 0)
-        if time.time() - mapped_at < 300:
+        # Pomijamy ponowne mapowanie tylko gdy to TO SAMO drzewo (ten sam obiekt).
+        # Po re-parsie (nawigacja/odswiezenie) drzewo jest nowe i trzeba je ponownie
+        # ostemplowac _atom_refs, inaczej hover-heat nie ma czego grzac.
+        if id(tree) == self._mapped_tree.get(url) and time.time() - mapped_at < 300:
             return self._page_holos.get(url)
 
         page_hash = hashlib.sha1(url.encode()).hexdigest()[:10]
@@ -123,6 +127,7 @@ class DOMMapper:
         self._page_bubbles[url] = ctx.bubble_lbls
         self._page_holos[url]   = hid or ""
         self._mapped_at[url]    = time.time()
+        self._mapped_tree[url]  = id(tree)
 
         return hid
 

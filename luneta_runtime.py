@@ -71,11 +71,32 @@ class LunetaRuntime:
     def __init__(self):
         self._bubbles:  Dict[str, LunetaBubble] = {}
         self._holograms: Dict[str, Dict[str, Any]] = {}
+        # E2: tekstury jako atomy substratu. Obraz obecny w bieżącym layoucie ->
+        # jego atom jest osiągalny (archiwum); gdy znika z layoutu i stygnie ->
+        # reach-GC go żnie. Zbiór aktualizuje warstwa renderu co przebudowę.
+        self._image_reach: set = set()
+        # Nazwane źródła osiągalności dla innych podsystemów (np. 'video' —
+        # siatka makrobloków AVC). Ten sam wzorzec co tekstury: w użyciu ->
+        # osiągalne; zwolnione -> stygną i giną.
+        self._reach_sets: Dict[str, set] = {}
         self.engine = KarmazynEngine(
             thermal=True,
-            extra_reach=lambda: {aid for b in self._bubbles.values() for aid in b.atom_ids},
+            extra_reach=lambda: (
+                {aid for b in self._bubbles.values() for aid in b.atom_ids}
+                | self._image_reach
+                | {aid for s in self._reach_sets.values() for aid in s}
+            ),
         )
         self.matrix = self.engine.reg
+
+    def set_image_reach(self, atom_ids) -> None:
+        """E2: ustawia osiągalne atomy-tekstury (obrazy w bieżącym layoucie)."""
+        self._image_reach = set(atom_ids)
+
+    def set_reach(self, name: str, atom_ids) -> None:
+        """Ustawia nazwane źródło osiągalności (np. 'video'). Pusty zbiór =
+        zwolnienie (atomy zaczną stygnąć i zostaną zżęte przez reach-GC)."""
+        self._reach_sets[name] = set(atom_ids)
 
     # ── Atomy ─────────────────────────────────────────────────────────────────
 

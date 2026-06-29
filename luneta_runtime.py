@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 
 from karmazyn_atom import (
     Atom, AtomRegistry,
-    T_INIT, T_MAX, T_HOT, T_WARM, T_TOMB,
+    T_MAX, T_HOT, T_WARM, T_TOMB,
     DECAY_DEFAULT,
 )
 from karmazyn_substrate import Store as KarmazynEngine

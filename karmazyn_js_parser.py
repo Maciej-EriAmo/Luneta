@@ -786,11 +786,11 @@ class JSParser:
                 
             if target[0] == "prop":
                 _, obj, key = target
-                return ("_assign", ("expr", ("setprop", obj, key, value)))
+                return ("_assign", ("setprop", obj, key, value))
                 
             if target[0] == "idx":
                 _, obj, idx = target
-                return ("_assign", ("expr", ("setidx", obj, idx, value)))
+                return ("_assign", ("setidx", obj, idx, value))
                 
             if target[0] == "array":
                 tmp = f"__da_{id(target)}"

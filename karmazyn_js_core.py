@@ -308,6 +308,8 @@ class KarmazynJSCore:
             val = self.eval(val_e, scope)
             if isinstance(obj, list):
                 if isinstance(idx, float): idx = int(idx)
+                if idx > 100000:
+                    raise RuntimeError("KarmazynJS: index tablicy zbyt duży")
                 while len(obj) <= idx: obj.append(None)
                 obj[idx] = val
             elif isinstance(obj, dict):
@@ -568,6 +570,8 @@ class KarmazynJSCore:
                     val = self.eval(inner[3], scope)
                     if isinstance(obj, list):
                         if isinstance(idx, float): idx = int(idx)
+                        if idx > 100000:
+                            raise RuntimeError("KarmazynJS: index tablicy zbyt duży")
                         while len(obj) <= idx: obj.append(None)
                         obj[idx] = val
                     elif isinstance(obj, dict):
@@ -655,19 +659,23 @@ class KarmazynJSCore:
                 try:
                     result = self.exec(try_body, scope.child())
                 except _Throw as e:
-                    if catch_body:
+                    if catch_body is not None:
                         catch_scope = scope.child()
                         if catch_name:
                             catch_scope.set(catch_name, e.value)
                         result = self.exec(catch_body, catch_scope)
+                    else:
+                        raise
                 except Exception as e:
-                    if catch_body:
+                    if catch_body is not None:
                         catch_scope = scope.child()
                         if catch_name:
                             catch_scope.set(catch_name, str(e))
                         result = self.exec(catch_body, catch_scope)
+                    else:
+                        raise
                 finally:
-                    if finally_body:
+                    if finally_body is not None:
                         self.exec(finally_body, scope.child())
 
             elif op == "block":

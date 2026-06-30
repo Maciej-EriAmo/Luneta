@@ -96,6 +96,42 @@ class DOMMapper:
         self._mapped_at:    Dict[str, float]     = {}
         self._mapped_tree:  Dict[str, int]       = {}
 
+    def release_page(self, url: str) -> int:
+        """DOM-COLD: zwalnia wszystkie atomy/bąble/hologram danej strony i
+        porzuca jej ślad. Atomy są usuwane z substratu (id są URL-skopowane
+        prefiksem dom_<hash(url)>, więc nie kolidują z inną stroną). Zwraca
+        liczbę usuniętych atomów."""
+        n = 0
+        for aid in self._page_atoms.pop(url, []):
+            try:
+                if self.runtime.delete_atom(aid) is not None:
+                    n += 1
+            except Exception:
+                pass
+        for lbl in self._page_bubbles.pop(url, []):
+            try:
+                self.runtime.release_bubble(lbl)
+            except Exception:
+                pass
+        hid = self._page_holos.pop(url, "")
+        if hid:
+            try:
+                self.runtime.release_hologram(hid)
+            except Exception:
+                pass
+        self._mapped_at.pop(url, None)
+        self._mapped_tree.pop(url, None)
+        return n
+
+    def release_others(self, keep_url: str) -> int:
+        """Zwalnia wszystkie zmapowane strony poza bieżącą. Wołane przy
+        nawigacji — ucina rosnący COLD: atomy starych stron nie zostają na
+        zawsze osiągalne przez swoje bąble."""
+        total = 0
+        for u in [k for k in list(self._page_atoms.keys()) if k != keep_url]:
+            total += self.release_page(u)
+        return total
+
     def map_page(self, page: Any) -> Optional[str]:
         url = page.url
         tree = getattr(page, "semantic_tree", None)
@@ -103,6 +139,11 @@ class DOMMapper:
 
         if getattr(page, "decode_failed", False): return None
         if looks_like_decode_error(getattr(page, "title", "") or ""): return None
+
+        # DOM-COLD: wejście na tę stronę zwalnia wszystkie inne zmapowane
+        # strony (ich atomy znikają z substratu). Przed strażnikiem re-mapowania,
+        # więc działa też przy ponownym renderze tej samej strony (idempotentne).
+        self.release_others(url)
 
         mapped_at = self._mapped_at.get(url, 0)
         # Pomijamy ponowne mapowanie tylko gdy to TO SAMO drzewo (ten sam obiekt).
@@ -360,6 +401,49 @@ class DOMMapper:
                 if atom and atom.T >= T_threshold: result.append(atom)
             except Exception: pass
         return result
+
+    # ── Paradygmat odczytu termicznego: "co jest teraz gorące" ───────────────
+    @staticmethod
+    def _readable(atom):
+        """(rola, tekst) atomu DOM do prezentacji czytelnikowi. Treść jest w E;
+        dla linków tekst jest w S po 'link:' (E to href)."""
+        S = atom.S or ""
+        E = atom.E or ""
+        if S.startswith("link:"):   return ("link", S[5:] or E)
+        if S.startswith("heading:"): return ("nagłówek", E)
+        if S.startswith("sent:"):   return (S[5:] or "tekst", E)
+        if S.startswith("cell:"):   return ("komórka", E)
+        if S == "title":            return ("tytuł", E)
+        if S == "code":             return ("kod", E)
+        if S == "li":               return ("punkt", E)
+        return (S or "tekst", E)
+
+    def hot_content(self, url: str = None, limit: int = 12,
+                    min_T: float = 30.0) -> List[Tuple[float, str, str, str]]:
+        """Zwraca treść, która jest TERAZ GORĄCA — to, co czytelnik czytał / na
+        co patrzył (hover-heat) i co jeszcze nie wystygło. Czyta istniejące pole
+        (atom.E = treść, atom.T = uwaga), bez nowego mechanizmu. min_T=30 = próg
+        WARM. url=None -> wszystkie śledzone strony (po DOM-COLD zwykle bieżąca).
+        Zwraca [(T, rola, tekst, url)] malejąco po T."""
+        if url is not None:
+            scope = [(url, self._page_atoms.get(url, []))]
+        else:
+            scope = list(self._page_atoms.items())
+        out = []
+        for u, aids in scope:
+            for aid in aids:
+                try:
+                    atom = self.runtime.get_atom(aid)
+                except Exception:
+                    atom = None
+                if atom is None or atom.T < min_T:
+                    continue
+                role, text = self._readable(atom)
+                if not text:
+                    continue
+                out.append((round(atom.T, 1), role, text, u))
+        out.sort(key=lambda x: -x[0])
+        return out[:limit] if limit else out
 
     def find_in_page(self, url: str, query: str) -> List[Tuple[str, str, float]]:
         atom_ids = self._page_atoms.get(url, [])

@@ -227,6 +227,16 @@ class DrawCtx:
     def polygon(self, pts: List[Tuple], color: Tuple) -> None:
         pygame.draw.polygon(self.surface, color, pts)
 
+    def blit(self, surf: "pygame.Surface", dest) -> None:
+        """Blit powierzchni do prostokąta dest (skaluje, gdy wymiary się różnią).
+        Wspólna ścieżka rysowania mediów (obraz/GIF/klatka wideo)."""
+        try:
+            if surf.get_width() != dest.w or surf.get_height() != dest.h:
+                surf = pygame.transform.smoothscale(surf, (max(1, dest.w), max(1, dest.h)))
+        except Exception:
+            surf = pygame.transform.scale(surf, (max(1, dest.w), max(1, dest.h)))
+        self.surface.blit(surf, (dest.x, dest.y))
+
     def clear(self, color: Tuple = C_BG, alpha: int = 220) -> None:
         if alpha >= 255:
             self.surface.fill(color, self.rect)

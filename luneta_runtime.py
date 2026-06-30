@@ -12,10 +12,24 @@ from typing import Any, Dict, List, Optional
 
 from karmazyn_atom import (
     Atom, AtomRegistry,
-    T_MAX, T_HOT, T_WARM, T_TOMB,
+    T_INIT, T_MAX, T_HOT, T_WARM, T_TOMB,
     DECAY_DEFAULT,
 )
 from karmazyn_substrate import Store as KarmazynEngine
+
+try:
+    from karmazyn_gif import ThermalGifPump
+    _HAS_GIF = True
+except Exception:
+    ThermalGifPump = None
+    _HAS_GIF = False
+
+try:
+    from karmazyn_media import MediaLayer, GifProvider, VectorProvider
+    _HAS_MEDIA = True
+except Exception:
+    MediaLayer = GifProvider = VectorProvider = None
+    _HAS_MEDIA = False
 
 
 # ─── Bubble — lekka wersja ───────────────────────────────────────────────────
@@ -89,6 +103,32 @@ class LunetaRuntime:
         )
         self.matrix = self.engine.reg
 
+        # E3: termiczny oscylator GIF — animacja napędzana temperaturą atomów.
+        self.gif_pump = ThermalGifPump(self.matrix) if _HAS_GIF else None
+
+        # Wspólny szew renderu mediów: jeden wzorzec dla GIF/wideo/wektora
+        # (obrazy E2 mogą tu dołączyć). Renderer i pętla dotykają tylko MediaLayer.
+        self.media = None
+        if _HAS_MEDIA:
+            self.media = MediaLayer(self)
+            if self.gif_pump is not None:
+                self.media.register(GifProvider(self.gif_pump))
+            self.media.register(VectorProvider(self))
+
+    def pump_gifs(self) -> int:
+        """Krok oscylatorów GIF + sprzątanie zżętych. Wołane z PĘTLI RENDERU
+        (co klatkę), nie z 1-sekundowego tick() — inaczej GIF-y szłyby po 1 kl/s.
+        Zwraca liczbę przesuniętych GIF-ów."""
+        if self.gif_pump is None:
+            return 0
+        adv = self.gif_pump.pump()
+        self.gif_pump.cleanup()
+        return adv
+
+    def pump_media(self) -> int:
+        """Krok wszystkich mediów czasowych przez wspólną warstwę (z pętli renderu)."""
+        return self.media.pump() if self.media is not None else 0
+
     def set_image_reach(self, atom_ids) -> None:
         """E2: ustawia osiągalne atomy-tekstury (obrazy w bieżącym layoucie)."""
         self._image_reach = set(atom_ids)
@@ -97,6 +137,16 @@ class LunetaRuntime:
         """Ustawia nazwane źródło osiągalności (np. 'video'). Pusty zbiór =
         zwolnienie (atomy zaczną stygnąć i zostaną zżęte przez reach-GC)."""
         self._reach_sets[name] = set(atom_ids)
+
+    def release_bubble(self, label: str) -> bool:
+        """Usuwa bąbel z osiągalności — jego atomy przestają być trzymane przy
+        życiu przez extra_reach (gdy nieosiągalne i zimne, reach-GC je zbierze).
+        Samych atomów nie kasuje. Zwraca True, gdy bąbel istniał."""
+        return self._bubbles.pop(label, None) is not None
+
+    def release_hologram(self, hid: str) -> bool:
+        """Porzuca wpis hologramu. Zwraca True, gdy istniał."""
+        return self._holograms.pop(hid, None) is not None
 
     # ── Atomy ─────────────────────────────────────────────────────────────────
 

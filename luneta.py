@@ -833,6 +833,7 @@ class GraphicPageViewer:
         # ── Stan grafiki (E1) ────────────────────────────────────────────
         self._images_dirty = False       # obraz się zdekodował -> przelicz layout
         self._js_dirty = False           # JS zmutował DOM -> przelicz layout (Szew B)
+        self.show_hot = False            # overlay "GORĄCE TERAZ" (klawisz H)
         try:
             rt = getattr(self.browser, "runtime", None)
             self.image_loader = ImageLoader(runtime=rt) if _HAS_IMAGES else None
@@ -871,8 +872,13 @@ class GraphicPageViewer:
             self.scroll_y = max(0, self.scroll_y - 300)
         elif event.key == pygame.K_PAGEDOWN:
             self.scroll_y = min(self.max_scroll, self.scroll_y + 300)
+        elif event.key == pygame.K_h:
+            self.show_hot = not self.show_hot     # overlay "GORĄCE TERAZ"
         elif event.key == pygame.K_ESCAPE:
-            self.close_callback()
+            if self.show_hot:
+                self.show_hot = False             # ESC zamyka najpierw overlay
+            else:
+                self.close_callback()
             
         return True
 
@@ -1211,6 +1217,57 @@ class GraphicPageViewer:
         # Po przeliczeniu (np. obrazy zmieniły wysokości) utrzymaj scroll w zakresie.
         self.scroll_y = max(0, min(self.scroll_y, self.max_scroll))
 
+    @staticmethod
+    def _heat_color(T):
+        """Kolor wg temperatury: zimne stalowoniebieskie -> ciepłe bursztynowe
+        -> gorące karmazynowe (#8B0000)."""
+        t = max(0.0, min(1.0, T / 100.0))
+        if t < 0.5:
+            f = t / 0.5
+            return (int(70 + f * 170), int(80 + f * 90), int(110 - f * 60))
+        f = (t - 0.5) / 0.5
+        return (int(240 - f * 100), int(170 - f * 150), int(50 - f * 30))
+
+    def _draw_hot_overlay(self, ctx, page):
+        """Powierzchnia paradygmatu: panel 'GORĄCE TERAZ' — treść, którą czytelnik
+        czytał / na którą patrzył (hover-heat), rankowana temperaturą uwagi.
+        Czyta dom_mapper.hot_content; rysowane na wierzchu strony."""
+        import pygame
+        mapper = getattr(self.browser, "dom_mapper", None)
+        if mapper is None or page is None:
+            return
+        try:
+            items = mapper.hot_content(url=getattr(page, "url", None), limit=14)
+        except Exception:
+            return
+        pw = min(470, ctx.rect.w - 32)
+        px = ctx.rect.right - pw - 16
+        py = ctx.rect.y + self.nav_h + 14
+        ph = ctx.rect.bottom - py - 16
+        ctx.box(pygame.Rect(px, py, pw, ph), fill=(16, 11, 13),
+                outline=(139, 0, 0), radius=6)
+        tx, ty = px + 14, py + 10
+        ctx.text("\u25e2 GOR\u0104CE TERAZ \u2014 co czyta\u0142e\u015b", (210, 70, 70), x=tx, y=ty)
+        ty += self.line_h + 8
+        row_h = self.line_h + 6
+        sw = 10
+        maxw = max(8, (pw - 30 - sw) // self.char_w)
+        if not items:
+            ctx.text("(pole jeszcze ch\u0142odne \u2014 poczytaj chwil\u0119)",
+                     (120, 110, 110), x=tx, y=ty)
+            return
+        for T, role, text, _u in items:
+            if ty + row_h > py + ph - 8:
+                break
+            ctx.box(pygame.Rect(tx, ty + 3, sw, self.line_h - 4),
+                    fill=self._heat_color(T))
+            label = f"[{role}] {text}"
+            if len(label) > maxw:
+                label = label[:maxw - 1] + "\u2026"
+            shade = 130 + int(min(1.0, T / 100.0) * 110)
+            ctx.text(label, (shade, shade - 25, shade - 25), x=tx + sw + 8, y=ty)
+            ty += row_h
+
     def _draw_all(self, ctx: DrawCtx):
         import pygame
         ctx.clear((12, 12, 18), alpha=215)
@@ -1298,6 +1355,9 @@ class GraphicPageViewer:
 
         self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect,
                                self.hovered_box, self.focused_field, self.image_loader)
+
+        if self.show_hot:
+            self._draw_hot_overlay(ctx, page)
 
 
 def show_help(term_state):

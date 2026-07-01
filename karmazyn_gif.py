@@ -74,7 +74,11 @@ class ThermalGifPump:
                 # convert('RGBA') komponuje klatkę (disposal/przezroczystość GIF-a);
                 # samo .copy() zostawiłoby częściową klatkę w trybie 'P'.
                 frame = img.convert("RGBA")
-                surf = pygame.image.fromstring(frame.tobytes(), frame.size, "RGBA")
+                try:
+                    surf = pygame.image.frombytes(frame.tobytes(), frame.size, "RGBA")
+                except AttributeError:
+                    surf = pygame.image.fromstring(frame.tobytes(), frame.size, "RGBA")
+                
                 try:
                     surf = surf.convert_alpha()
                 except Exception:

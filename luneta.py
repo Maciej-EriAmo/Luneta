@@ -317,13 +317,14 @@ class LayoutBox:
 
 # ─── 2. SILNIK UKŁADU (Iteracyjny DFS z przepływem Inline) ──────────────────
 class LayoutEngine:
-    def __init__(self, max_w: int, char_w: int, line_h: int, image_loader=None, base_url="", css_rules=None):
+    def __init__(self, max_w: int, char_w: int, line_h: int, image_loader=None, base_url="", css_rules=None, measure_fn=None):
         self.max_w = max_w
         self.char_w = char_w
         self.line_h = line_h
         self.image_loader = image_loader
         self.base_url = base_url or ""
         self.css_rules = css_rules or []
+        self.measure_fn = measure_fn
 
     def build(self, root_node, start_x: int, start_y: int):
         boxes = []
@@ -342,6 +343,7 @@ class LayoutEngine:
 
         def add_text_chunk(text, color, node, btype, indent, style=STYLE_NONE):
             nonlocal current_x, current_y
+            space_w = self.measure_fn(" ", style) if self.measure_fn else self.char_w
             words = text.replace('\n', ' ').split(' ')
             for w in words:
                 if not w:
@@ -349,13 +351,13 @@ class LayoutEngine:
                 w = w.translate(_ZW_TABLE)   # usuń znaki zerowej szerokości
                 if not w:
                     continue
-                w_len = len(w) * self.char_w
+                w_len = self.measure_fn(w, style) if self.measure_fn else (len(w) * self.char_w)
                 # Łamanie wiersza, gdy słowo nie mieści się w dokumencie
                 if current_x + w_len > start_x + self.max_w - indent and current_x > start_x + indent:
                     flush_line(indent)
                 r = pygame.Rect(current_x, current_y, w_len, self.line_h)
                 boxes.append(LayoutBox(r, w, color, node, btype, style))
-                current_x += w_len + self.char_w
+                current_x += w_len + space_w
 
         def add_field(node, kind, form, indent):
             nonlocal current_x, current_y
@@ -1322,6 +1324,8 @@ class GraphicPageViewer:
             self.hovered_box = None
             self._last_heated_node = None
             self.focused_field = None
+            if self.dom_renderer:
+                self.dom_renderer.font_cache.clear() # Zwalnianie osieroconych tekstur
 
         tree = getattr(page, "semantic_tree", None)
         if not tree:
@@ -1334,10 +1338,15 @@ class GraphicPageViewer:
         max_w = ctx.rect.w - 80
         char_w = max(1, ctx.font.size("A")[0])
         
+        # Wstrzykujemy funkcję pomiarową opartą o natywne właściwości czcionek
+        def measure_text(text, style):
+            return self.dom_renderer._font_for(style).size(text)[0]
+
         engine = LayoutEngine(max_w, char_w, ctx._line_h,
                               image_loader=self.image_loader, base_url=page.url,
                               css_rules=(getattr(page, "_css_all", None)
-                                         or getattr(page, "css_rules", [])))
+                                         or getattr(page, "css_rules", [])),
+                              measure_fn=measure_text)
         self.layout_boxes, max_y = engine.build(tree, cx, start_y)
 
         # Zleć pobranie wszystkich obrazów strony (src już absolutny po add_image).

@@ -258,7 +258,7 @@ def http_get(url, headers=None, timeout=15.0):
                     truncated = True
                     break
             elapsed = (time.time() - start) * 1000
-            return HttpResponse(url=url, status=r.status,
+            return HttpResponse(url=getattr(r, 'url', url), status=r.status,
                                 content_type=r.headers.get('Content-Type', ''),
                                 body=bytes(data), headers=dict(r.headers),
                                 elapsed_ms=elapsed, truncated=truncated)

@@ -28,6 +28,7 @@ a load_gif zwraca False.
 
 import io
 import time
+import hashlib
 
 from karmazyn_atom import AtomRegistry, T_HOT
 
@@ -42,6 +43,13 @@ except Exception:
 
 # Poniżej tej temperatury oscylator zamarza (= T_WARM substratu).
 FREEZE_T = 30.0
+
+
+def gif_aid(url: str) -> str:
+    """Identyfikator atomu-oscylatora GIF wyprowadzony z URL. Liczony tak samo
+    w LayoutEngine (oznaczenie pudełka) i w ładowarce (rejestracja klatek),
+    więc renderer trafia w ten sam atom bez przekazywania stanu."""
+    return "gif:" + hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
 
 
 class ThermalGifPump:

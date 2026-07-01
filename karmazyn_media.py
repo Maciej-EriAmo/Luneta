@@ -77,25 +77,47 @@ class VectorProvider:
         atom = self.runtime.get_atom(aid)
         if atom is None:
             return False
+        warm = max(0.0, min(1.0, atom.T / 100.0))
+        col = tuple(int(c * (0.5 + 0.5 * warm)) for c in self.stroke)
+        meta = getattr(atom, "metadata", None) or {}
+        polys = meta.get("polylines")
+        if polys:
+            allpts = [p for poly in polys for p in poly]
+            if len(allpts) < 2:
+                return False
+            tr = self._fit_transform(allpts, rect)
+            drew = False
+            for poly in polys:
+                d = ThermalVector.decimate(poly, atom.T)
+                if len(d) < 2:
+                    continue
+                screen = self._apply(d, tr)
+                for i in range(len(screen) - 1):
+                    ctx.line(screen[i], screen[i + 1], col, 1)
+                drew = True
+            return drew
+        # pojedyncza łamana (metadata["points"])
         pts = ThermalVector.get_drawable_points_rdp(atom)
         if len(pts) < 2:
             return False
-        screen = self._fit(pts, rect)
-        # cieplejszy kształt jaśniejszy
-        warm = max(0.0, min(1.0, atom.T / 100.0))
-        col = tuple(int(c * (0.5 + 0.5 * warm)) for c in self.stroke)
+        screen = self._apply(pts, self._fit_transform(pts, rect))
         for i in range(len(screen) - 1):
             ctx.line(screen[i], screen[i + 1], col, 1)
         return True
 
     @staticmethod
-    def _fit(pts, rect):
+    def _fit_transform(pts, rect):
         xs = [p[0] for p in pts]; ys = [p[1] for p in pts]
         minx, maxx = min(xs), max(xs); miny, maxy = min(ys), max(ys)
         sw = (maxx - minx) or 1.0; sh = (maxy - miny) or 1.0
         s = min(rect.w / sw, rect.h / sh)
         ox = rect.x + (rect.w - sw * s) / 2.0
         oy = rect.y + (rect.h - sh * s) / 2.0
+        return (minx, miny, s, ox, oy)
+
+    @staticmethod
+    def _apply(pts, tr):
+        minx, miny, s, ox, oy = tr
         return [(ox + (x - minx) * s, oy + (y - miny) * s) for x, y in pts]
 
     def pump(self):
@@ -106,6 +128,58 @@ class VectorProvider:
 
 
 # ─── Warstwa ──────────────────────────────────────────────────────────────────
+
+class SpriteProvider:
+    """Wycinek arkusza sprite'ów (atlasu) jako medium. Atom niesie źródło i
+    prostokąt wycinka (metadata: src, crop=(sx,sy,sw,sh)); provider pobiera pełny
+    atlas z ładowarki obrazów i blituje tylko wskazany kawałek. Ciepło z
+    widoczności, jak każde medium."""
+    KIND = "sprite"
+
+    def __init__(self, runtime):
+        self.runtime = runtime
+        self.loader = None                 # ustawiany przez viewer (ma ładowarkę)
+
+    def set_loader(self, loader):
+        self.loader = loader
+
+    def note_visible(self, aid, weight=1.0):
+        atom = self.runtime.get_atom(aid)
+        if atom is not None:
+            atom.touch(weight)
+
+    def draw(self, ctx, aid, rect):
+        atom = self.runtime.get_atom(aid)
+        if atom is None or self.loader is None:
+            return False
+        meta = getattr(atom, "metadata", None) or {}
+        src = meta.get("src"); crop = meta.get("crop")
+        if not src or not crop:
+            return False
+        surf, _status = self.loader.get(src, 0, 0)     # pełny atlas (nieskalowany)
+        if surf is None:
+            return False
+        sx, sy, sw, sh = crop
+        aw, ah = surf.get_width(), surf.get_height()
+        # background-size (retina): CSS podaje pozycję/rozmiar w px logicznych, a
+        # atlas bywa większy (np. _hr = 2x). Skalujemy crop do pikseli atlasu.
+        size = meta.get("size")
+        if size and size[0] > 0 and size[1] > 0:
+            fx, fy = aw / size[0], ah / size[1]
+            sx, sy, sw, sh = sx * fx, sy * fy, sw * fx, sh * fy
+        sx, sy, sw, sh = int(round(sx)), int(round(sy)), int(round(sw)), int(round(sh))
+        if sx >= aw or sy >= ah or sw <= 0 or sh <= 0:
+            return False
+        sw = min(sw, aw - sx); sh = min(sh, ah - sy)     # przytnij do atlasu
+        ctx.blit_crop(surf, (sx, sy, sw, sh), rect)
+        return True
+
+    def pump(self):
+        return 0
+
+    def reach_ids(self, aids):
+        return {a for a in aids if self.runtime.has_atom(a)}
+
 
 class MediaLayer:
     def __init__(self, runtime):

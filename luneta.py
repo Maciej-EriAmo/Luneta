@@ -51,6 +51,31 @@ except ImportError:
     _HAS_IMAGES = False
     ImageLoader = None
 
+try:
+    from karmazyn_gif import gif_aid as _gif_aid
+except Exception:
+    def _gif_aid(url):
+        import hashlib
+        return "gif:" + hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+
+try:
+    from karmazyn_svg import svg_aid as _svg_aid
+except Exception:
+    def _svg_aid(url):
+        import hashlib
+        return "svg:" + hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+
+try:
+    from karmazyn_css import (sprite_from_decls as _sprite_from_decls,
+                              resolve as _css_resolve,
+                              parse_declarations as _css_inline,
+                              element_classes as _css_classes,
+                              sprite_aid as _sprite_aid,
+                              bg_color_from_decls as _css_bgcolor)
+    _HAS_CSS = True
+except Exception:
+    _HAS_CSS = False
+
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 def strip_ansi(text: str) -> str:
     return ANSI_RE.sub('', str(text))
@@ -292,18 +317,20 @@ class LayoutBox:
 
 # ─── 2. SILNIK UKŁADU (Iteracyjny DFS z przepływem Inline) ──────────────────
 class LayoutEngine:
-    def __init__(self, max_w: int, char_w: int, line_h: int, image_loader=None, base_url=""):
+    def __init__(self, max_w: int, char_w: int, line_h: int, image_loader=None, base_url="", css_rules=None):
         self.max_w = max_w
         self.char_w = char_w
         self.line_h = line_h
         self.image_loader = image_loader
         self.base_url = base_url or ""
+        self.css_rules = css_rules or []
 
     def build(self, root_node, start_x: int, start_y: int):
         boxes = []
         # Krotka stosu: (węzeł, wcięcie, czy_post, styl_odziedziczony, form)
         # form = najbliższy przodek <form> (SemanticNode) albo None.
         stack = [(root_node, 0, False, STYLE_NONE, None)]
+        bg_stack = []          # równoległy do post-markerów: ładunek tła (idx, top, kolor, indent) lub None
         current_y = start_y
         current_x = start_x
 
@@ -454,6 +481,16 @@ class LayoutEngine:
                 w = avail
 
             meta = {"src": src, "alt": alt}
+            # Animowany GIF -> medium termiczne (oscylator). Pudełko zostaje typu
+            # "image" (layout/rozmiar bez zmian); renderer skieruje je do MediaLayer.
+            if src:
+                low = src.split("?", 1)[0].lower()
+                if low.endswith(".gif"):
+                    meta["media_kind"] = "gif"
+                    meta["media_aid"] = _gif_aid(src)
+                elif low.endswith(".svg"):
+                    meta["media_kind"] = "vector"   # SVG -> łamane (ThermalVector)
+                    meta["media_aid"] = _svg_aid(src)
             # Małe obrazy płyną inline (ikony); duże zachowują się jak blok.
             if h <= self.line_h:
                 if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
@@ -481,6 +518,42 @@ class LayoutEngine:
             target = inner_img if inner_img is not None else node
             add_image(target, indent, src_override=resolved)
 
+        def add_sprite(node, indent, spr):
+            """Emisja wycinka atlasu (sprite CSS) jako pudełko-medium w przepływie.
+            Rozmiar = width/height z CSS (crop[2:]); atom-sprite trafia do substratu,
+            atlas do kolejki pobrań. Renderuje SpriteProvider (crop-blit z termiką)."""
+            nonlocal current_x, current_y
+            src = spr.get("src"); crop = spr.get("crop")
+            if not src or not crop:
+                return
+            w = crop[2] if crop[2] > 0 else 16
+            h = crop[3] if crop[3] > 0 else 16
+            aid = _sprite_aid(src, crop)
+            rt = getattr(self.image_loader, "_runtime", None)
+            if rt is not None and not rt.matrix.has(aid):
+                rt.matrix.create(aid, S="media:sprite", E=src, T=70.0, metadata=spr)
+            if self.image_loader is not None:
+                try:
+                    self.image_loader.request(src)      # atlas pobierany jak obraz
+                except Exception:
+                    pass
+            meta = {"src": src, "media_kind": "sprite", "media_aid": aid}
+            avail = self.max_w - indent
+            if w > avail and w > 0:
+                h = max(1, round(h * avail / w)); w = avail
+            if h <= self.line_h:                        # ikona -> inline
+                if current_x + w > start_x + self.max_w - indent and current_x > start_x + indent:
+                    flush_line(indent)
+                r = pygame.Rect(current_x, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (60, 60, 75), node, "image", STYLE_NONE, meta))
+                current_x += w + self.char_w
+            else:                                       # duży -> blok
+                flush_line(indent)
+                r = pygame.Rect(start_x + indent, current_y, w, h)
+                boxes.append(LayoutBox(r, "", (60, 60, 75), node, "image", STYLE_NONE, meta))
+                current_y += h + 4
+                current_x = start_x + indent
+
         while stack:
             node, indent, is_post, style, form = stack.pop()
             
@@ -488,8 +561,16 @@ class LayoutEngine:
             
             # Post-processing bloków
             if is_post:
+                bg = bg_stack.pop() if bg_stack else None
                 if is_block:
                     flush_line(indent)
+                if bg is not None:
+                    _idx, _top, _col, _ind = bg
+                    if current_y >= _top:
+                        _fr = pygame.Rect(start_x + _ind, _top,
+                                          self.max_w - _ind, max(self.line_h, current_y - _top))
+                        boxes.insert(_idx, LayoutBox(_fr, "", _col, node, "fill", STYLE_NONE, None))
+                if is_block:
                     current_y += 6
                 continue
                 
@@ -508,7 +589,30 @@ class LayoutEngine:
                 is_field = field_kind is not None
             is_image = (typ == NodeType.INLINE and tag == "img")
             is_picture = (typ == NodeType.INLINE and tag == "picture")
-            
+
+            # ── CSS: display:none/visibility:hidden (pomiń poddrzewo) + sprite'y + tło ──
+            _bg_payload = None
+            if _HAS_CSS and typ != NodeType.TEXT and tag:
+                _attrs = getattr(node, "attrs", {}) or {}
+                _decls = {}
+                if self.css_rules:
+                    _decls = _css_resolve(self.css_rules, tag,
+                                          _attrs.get("id"), _css_classes(_attrs))
+                if _attrs.get("style"):
+                    _decls = {**_decls, **_css_inline(_attrs["style"])}   # inline wygrywa
+                if _decls:
+                    if (_decls.get("display", "").strip().lower() == "none"
+                            or _decls.get("visibility", "").strip().lower() == "hidden"):
+                        continue                                    # element i dzieci pominięte
+                    if not is_image and not is_picture:
+                        _spr = _sprite_from_decls(_decls, self.base_url)
+                        if _spr:
+                            add_sprite(node, indent, _spr)
+                    if is_block:                                    # tło bloku -> wypełnienie za treścią
+                        _col = _css_bgcolor(_decls)
+                        if _col is not None:
+                            _bg_payload = (len(boxes), current_y, _col, indent)
+
             if typ == NodeType.TEXT:
                 text = (node.text or "").strip()
                 if text:
@@ -551,6 +655,7 @@ class LayoutEngine:
             child_form = node if (typ == NodeType.INLINE and tag == "form") else form
             
             stack.append((node, indent, True, style, form))
+            bg_stack.append(_bg_payload)      # równolegle: tło bloku (lub None)
             # Nie schodzimy w dzieci LINK/HEADING (tekst brany przez get_plain_text),
             # pól, obrazów ani <picture> (zawartość już skonsumowana).
             if typ not in (NodeType.LINK, NodeType.HEADING) and not is_field and not is_image and not is_picture:
@@ -606,7 +711,7 @@ class DOMRenderer:
             self.font_cache[key] = self._render_text(self._font_for(style), text, color)
         return self.font_cache[key]
 
-    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect, hovered_box=None, focused_box=None, image_loader=None):
+    def draw(self, ctx: DrawCtx, boxes: list, scroll_y: int, clip_rect, hovered_box=None, focused_box=None, image_loader=None, media=None):
         import pygame
         old_clip = ctx.surface.get_clip()
         ctx.surface.set_clip(clip_rect)
@@ -653,7 +758,10 @@ class DOMRenderer:
                 self._draw_field(ctx, box, box_y, focused, blink_on)
 
             elif box.box_type == "image":
-                self._draw_image(ctx, box, box_y, image_loader)
+                self._draw_image(ctx, box, box_y, image_loader, media)
+            elif box.box_type == "fill":
+                ctx.box(pygame.Rect(box.rect.x, box_y, box.rect.w, box.rect.h),
+                        fill=box.color)
             # box_type == "hidden_field" -> nic nie rysujemy
 
         ctx.surface.set_clip(old_clip)
@@ -757,12 +865,26 @@ class DOMRenderer:
         # Wysokość pojedynczego wiersza tekstu (do pionowego centrowania w polach).
         return self._font_for(STYLE_NONE).get_height() + 2
 
-    def _draw_image(self, ctx, box, box_y, loader):
+    def _draw_image(self, ctx, box, box_y, loader, media=None):
         import pygame
         rect = pygame.Rect(box.rect.x, box_y, box.rect.w, box.rect.h)
         meta = box.meta or {}
         src = meta.get("src", "")
         alt = meta.get("alt", "")
+
+        # Medium termiczne (GIF/wideo/wektor): widoczność grzeje, MediaLayer rysuje
+        # bieżącą klatkę. Rodzaj z meta (po rozszerzeniu) albo z ładowarki (po treści
+        # — łapie SVG/GIF bez rozszerzenia). Gdy niezaładowane -> placeholder niżej.
+        kind = meta.get("media_kind")
+        aid = meta.get("media_aid")
+        if not kind and loader is not None and src:
+            k = loader.media_kind(src)
+            if k:
+                kind, aid = k, loader.media_aid(src)
+        if kind and media is not None:
+            media.note_visible(kind, aid)
+            if media.draw(ctx, kind, aid, rect):
+                return
 
         surf, status = (None, "empty")
         if loader is not None and src:
@@ -839,6 +961,19 @@ class GraphicPageViewer:
             self.image_loader = ImageLoader(runtime=rt) if _HAS_IMAGES else None
         except Exception:
             self.image_loader = None
+        # Wspólny szew mediów (GIF/wektor/...) — renderer i pętla dotykają tylko jego.
+        self.media = getattr(getattr(self.browser, "runtime", None), "media", None)
+        if self.media is not None:
+            sp = self.media.provider_for("sprite")
+            if sp is not None:
+                sp.set_loader(self.image_loader)   # sprite tnie z tekstur ładowarki
+        # Asynchroniczne pobieranie zewnętrznych arkuszy CSS.
+        try:
+            from karmazyn_css_loader import CssLoader
+            self.css_loader = CssLoader(runtime=getattr(self.browser, "runtime", None))
+        except Exception:
+            self.css_loader = None
+        self._css_page_url = None
 
     def wants_keys(self):
         return True
@@ -1200,7 +1335,9 @@ class GraphicPageViewer:
         char_w = max(1, ctx.font.size("A")[0])
         
         engine = LayoutEngine(max_w, char_w, ctx._line_h,
-                              image_loader=self.image_loader, base_url=page.url)
+                              image_loader=self.image_loader, base_url=page.url,
+                              css_rules=(getattr(page, "_css_all", None)
+                                         or getattr(page, "css_rules", [])))
         self.layout_boxes, max_y = engine.build(tree, cx, start_y)
 
         # Zleć pobranie wszystkich obrazów strony (src już absolutny po add_image).
@@ -1273,7 +1410,19 @@ class GraphicPageViewer:
         ctx.clear((12, 12, 18), alpha=215)
         
         page = getattr(self.browser, "_current", None)
-        
+
+        # ── CSS: zewnętrzne arkusze pobierane asynchronicznie (jak obrazy) ──
+        if page is not None and self.css_loader is not None:
+            if getattr(page, "url", None) != self._css_page_url:
+                self._css_page_url = getattr(page, "url", None)
+                self.css_loader.reset()
+                self.css_loader.request_many(getattr(page, "stylesheet_links", []))
+                page._css_all = list(getattr(page, "css_rules", []))   # reguły z <style> od razu
+            if self.css_loader.poll():
+                # doszły zewnętrzne reguły -> scal i przelicz layout (sprite'y się doresolwują)
+                page._css_all = list(getattr(page, "css_rules", [])) + self.css_loader.rules()
+                self._images_dirty = True
+
         nav_rect = pygame.Rect(ctx.rect.x, ctx.rect.y, ctx.rect.w, self.nav_h)
         ctx.box(nav_rect, fill=(24, 24, 38), outline=(50, 50, 75))
         
@@ -1340,6 +1489,28 @@ class GraphicPageViewer:
                 self.image_loader.update_reach(img_srcs)
             except Exception:
                 pass
+
+        # ── Media termiczne (GIF/wektor/...): pompa czasowych co klatkę + osiągalność
+        # mediów obecnych w layoucie (poza layoutem stygną i są żęte przez reach-GC).
+        if self.media is not None:
+            try:
+                rt = getattr(self.browser, "runtime", None)
+                if rt is not None:
+                    rt.pump_media()
+                pairs = []
+                for b in self.layout_boxes:
+                    if b.box_type != "image" or not b.meta:
+                        continue
+                    k = b.meta.get("media_kind"); a = b.meta.get("media_aid")
+                    if not k and self.image_loader is not None:
+                        s = b.meta.get("src")
+                        k = self.image_loader.media_kind(s)
+                        a = self.image_loader.media_aid(s)
+                    if k:
+                        pairs.append((k, a))
+                self.media.update_reach(pairs)
+            except Exception:
+                pass
         
         if not self.layout_boxes:
             ctx.text(f"Brak drzewa DOM dla: {page.title}", (255, 100, 100), x=ctx.rect.x + 40, y=ctx.rect.y + self.nav_h + 30)
@@ -1354,7 +1525,8 @@ class GraphicPageViewer:
         self._apply_hover_heat(self.hovered_box, pygame.time.get_ticks())
 
         self.dom_renderer.draw(ctx, self.layout_boxes, self.scroll_y, clip_rect,
-                               self.hovered_box, self.focused_field, self.image_loader)
+                               self.hovered_box, self.focused_field, self.image_loader,
+                               self.media)
 
         if self.show_hot:
             self._draw_hot_overlay(ctx, page)

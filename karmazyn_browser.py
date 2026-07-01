@@ -269,6 +269,60 @@ def http_get(url, headers=None, timeout=15.0):
         elapsed = (time.time() - start) * 1000
         return HttpResponse(url=url, status=0, content_type='', body=str(e).encode(), headers={}, elapsed_ms=elapsed)
 
+
+def http_post(url, data, headers=None, timeout=15.0):
+    """POST application/x-www-form-urlencoded. `data` może być listą par
+    (name, value), słownikiem, str lub bytes. Przekierowania po POST są
+    obsługiwane przez urllib (303 -> GET), więc zwracana jest strona finalna."""
+    supported = ['gzip', 'deflate']
+    if HAS_BROTLI:
+        supported.append('br')
+    if isinstance(data, (list, tuple, dict)):
+        body = urllib.parse.urlencode(data).encode('utf-8')
+    elif isinstance(data, str):
+        body = data.encode('utf-8')
+    elif isinstance(data, (bytes, bytearray)):
+        body = bytes(data)
+    else:
+        body = b''
+    hdrs = {
+        'User-Agent': DEFAULT_UA,
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Accept-Encoding': ', '.join(supported),
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+    }
+    if headers:
+        hdrs.update(headers)
+    start = time.time()
+    try:
+        req = urllib.request.Request(url, data=body, headers=hdrs, method='POST')
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data_buf = bytearray()
+            truncated = False
+            while True:
+                chunk = r.read(8192)
+                if not chunk: break
+                data_buf.extend(chunk)
+                if len(data_buf) > MAX_PAGE_SIZE:
+                    data_buf = data_buf[:MAX_PAGE_SIZE]
+                    truncated = True
+                    break
+            elapsed = (time.time() - start) * 1000
+            return HttpResponse(url=getattr(r, 'url', url), status=r.status,
+                                content_type=r.headers.get('Content-Type', ''),
+                                body=bytes(data_buf), headers=dict(r.headers),
+                                elapsed_ms=elapsed, truncated=truncated)
+    except socket.timeout:
+        elapsed = (time.time() - start) * 1000
+        return HttpResponse(url=url, status=0, content_type='', body=b'Timeout', headers={}, elapsed_ms=elapsed)
+    except Exception as e:
+        elapsed = (time.time() - start) * 1000
+        return HttpResponse(url=url, status=0, content_type='', body=str(e).encode(), headers={}, elapsed_ms=elapsed)
+
+
 class NodeType:
     DOCUMENT = 0; BLOCK = 1; INLINE = 2; HEADING = 3; LINK = 4
     LIST = 5; TABLE = 6; PRE = 7; TEXT = 8; HR = 9
@@ -309,6 +363,9 @@ class ParsedPage:
     semantic_tree: Optional[SemanticNode] = None
     truncated: bool = False
     decode_failed: bool = False
+    inline_css: str = ""
+    stylesheet_links: List[str] = field(default_factory=list)
+    css_rules: list = field(default_factory=list)
     _lines_cache: Optional[List[str]] = None
 
     def invalidate_cache(self):
@@ -381,6 +438,11 @@ class SemanticHTMLParser(HTMLParser):
         self.in_any_script = False
         self.all_scripts_content = ""
 
+        # CSS: przechwyt <style> i zebranie <link rel=stylesheet href>
+        self.in_style = False
+        self.inline_css = ""
+        self.stylesheet_links = []
+
     def _is_hidden(self, attrs):
         style = attrs.get('style', '').replace(' ', '').lower()
         return ('hidden' in attrs or
@@ -399,6 +461,14 @@ class SemanticHTMLParser(HTMLParser):
             ad.get('type', '').lower() in ('application/json', 'application/ld+json', 'application/json+oembed') 
             or ad.get('id') == '__NEXT_DATA__'
         )
+
+        if tag == 'style' and not is_data_script:
+            self.in_style = True          # treść <style> przechwytujemy w handle_data
+        if tag == 'link':
+            rel = (ad.get('rel', '') or '').lower()
+            href = ad.get('href', '')
+            if 'stylesheet' in rel and href:
+                self.stylesheet_links.append(href)
 
         if tag == 'noscript':
             pass 
@@ -444,6 +514,8 @@ class SemanticHTMLParser(HTMLParser):
         
         if tag == 'script':
             self.in_any_script = False
+        if tag == 'style':
+            self.in_style = False
         
         if self.in_data_script and tag == 'script':
             self.in_data_script = False
@@ -487,7 +559,11 @@ class SemanticHTMLParser(HTMLParser):
     def handle_data(self, data):
         if getattr(self, 'in_any_script', False):
             self.all_scripts_content += data
-            
+
+        if getattr(self, 'in_style', False):
+            self.inline_css += data       # treść <style> -> bufor CSS
+            return
+
         if self.in_data_script:
             self.data_script_content += data
             return
@@ -688,10 +764,20 @@ def parse_html(html_text, url='', width=DISPLAY_WIDTH, truncated=False):
     
     renderer = ANSIRenderer(url, width)
     renderer.render(parser.root)
+
+    # CSS: reguły z <style> od razu; zewnętrzne arkusze dociągane asynchronicznie.
+    try:
+        from karmazyn_css import parse_stylesheet
+        inline_rules = parse_stylesheet(parser.inline_css)
+    except Exception:
+        inline_rules = []
+    sheet_links = [_resolve_url(h, url) for h in parser.stylesheet_links]
+
     return ParsedPage(
         title=parser.title.strip() or url, chunks=renderer.chunks, links=renderer.links,
         headings=renderer.headings, raw_html=html_text, url=url, width=width,
         semantic_tree=parser.root, truncated=truncated,
+        inline_css=parser.inline_css, stylesheet_links=sheet_links, css_rules=inline_rules,
     )
 
 class LunetaBrowser:
@@ -764,11 +850,12 @@ class LunetaBrowser:
             else: self.runtime.create_atom(label, url[:64], url, temp)
         except Exception: pass
 
-    def _load_url(self, url, add_to_history=True, force_reload=False):
+    def _load_url(self, url, add_to_history=True, force_reload=False, post_data=None):
         if not url.startswith(('http://', 'https://')): url = 'https://' + url
         cur = _normalize_url(url)
+        send_post = post_data is not None   # POST tylko dla pierwszego żądania (chyba że 307/308)
         for _ in range(5):
-            if not force_reload:
+            if not force_reload and not send_post:
                 cached = self._cache_get(cur)
                 if cached:
                     page, _ = cached
@@ -781,12 +868,15 @@ class LunetaBrowser:
                     self._map_dom(page)
                     self._invalidate_render_cache()
                     return True, self._render_current()
-            resp = http_get(cur)
+            resp = http_post(cur, post_data) if send_post else http_get(cur)
             if resp.status in (301, 302, 303, 307, 308):
                 loc = resp.headers.get('Location') or resp.headers.get('location')
                 if loc:
                     nxt = _normalize_url(_resolve_url(loc, cur))
                     if nxt and nxt != cur:
+                        # 301/302/303 zmieniają metodę na GET; 307/308 zachowują POST.
+                        if resp.status not in (307, 308):
+                            send_post = False
                         cur = nxt; continue
             break
         if not resp or not resp.ok(): return False, f'HTTP {resp.status if resp else 0}: {cur}'
@@ -795,7 +885,8 @@ class LunetaBrowser:
         
         page = parse_html(resp.text, url=cur, width=self.width, truncated=resp.truncated)
         page.decode_failed = not getattr(resp, '_decode_ok', True)
-        self._cache_put(cur, page)
+        if post_data is None:           # odpowiedzi POST nie cache'ujemy (nieidempotentne)
+            self._cache_put(cur, page)
         self._update_atom_temp(cur, self.T_FRESH)
         
         if add_to_history and self._current:
@@ -828,6 +919,9 @@ class LunetaBrowser:
         self._scroll = max(0, min(self._scroll, max(0, total - PAGE_SIZE)))
 
     def go(self, url, force_reload=False): return self._load_url(url, True, force_reload)
+    def post(self, url, data):
+        """Wysyła formularz metodą POST i ładuje odpowiedź (z historią)."""
+        return self._load_url(url, add_to_history=True, force_reload=True, post_data=data)
     def back(self):
         if not self._history: return False, 'Brak historii.'
         if self._current: self._forward.appendleft(self._current.url)

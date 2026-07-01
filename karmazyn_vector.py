@@ -122,3 +122,15 @@ class ThermalVector:
         if eps <= 0.0:
             return list(base)
         return ThermalVector._rdp(base, eps)
+
+    @staticmethod
+    def decimate(points: list, T: float) -> list:
+        """LOD (Douglas-Peucker) dla SUROWEJ łamanej przy temperaturze T. Używane
+        przy wielu łamanych (SVG), gdzie każda jest cieniowana wspólnym T atomu."""
+        if T < T_TOMB:
+            return []
+        pts = list(points)
+        if len(pts) <= 2:
+            return pts
+        eps = ThermalVector.thermal_epsilon(T, ThermalVector._bbox_diag(pts))
+        return pts if eps <= 0.0 else ThermalVector._rdp(pts, eps)

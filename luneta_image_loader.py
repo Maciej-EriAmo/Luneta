@@ -27,6 +27,19 @@ import hashlib
 import threading
 import urllib.parse
 
+try:
+    from karmazyn_gif import gif_aid as _gif_aid
+except Exception:
+    def _gif_aid(url):
+        return "gif:" + hashlib.sha1((url or "").encode("utf-8")).hexdigest()[:16]
+
+try:
+    from karmazyn_svg import parse_svg as _parse_svg, svg_aid as _svg_aid
+    _HAS_SVG = True
+except Exception:
+    _parse_svg = _svg_aid = None
+    _HAS_SVG = False
+
 # E2: startowa temperatura atomu-tekstury (WARM, spójna z substratem T_INIT).
 _TEX_T_INIT = 50.0
 
@@ -61,6 +74,8 @@ class ImageLoader:
 
         # Stan WYŁĄCZNIE głównego wątku (worker go nie dotyka):
         self._status = {}                      # url -> stan
+        self._media_kind = {}                  # url -> "gif"|"vector" (detekcja po treści)
+        self._media_aid = {}                   # url -> atom_id medium
         self._url_sha = {}                     # url -> sha256(bajty)
         self._orig = {}                        # sha -> Surface (zdekodowana, nieskalowana)
         self._scaled = {}                      # (sha, w, h) -> Surface
@@ -134,6 +149,43 @@ class ImageLoader:
                 if not data:
                     raise ValueError("brak danych")
                 sha = hashlib.sha256(data).hexdigest()
+                # Detekcja medium PO TREŚCI (magia bajtów), niezależna od URL —
+                # łapie SVG/GIF podane bez rozszerzenia, z query, data-uri czy .svgz.
+                gp = getattr(self._runtime, "gif_pump", None)
+                if data[:4] == b"GIF8" and gp is not None:
+                    aid = _gif_aid(url)
+                    if not gp.has(aid):
+                        gp.load_gif(aid, data, label=url)
+                    self._media_kind[url] = "gif"; self._media_aid[url] = aid
+                    self._status[url] = "ready"
+                    changed.add(url)
+                    continue
+                svg_bytes = data
+                if data[:2] == b"\x1f\x8b":            # gzip -> .svgz
+                    try:
+                        import gzip
+                        svg_bytes = gzip.decompress(data)
+                    except Exception:
+                        svg_bytes = data
+                head = svg_bytes[:512].lstrip()
+                looks_svg = (head[:5].lower() == b"<?xml" or head[:4].lower() == b"<svg"
+                             or b"<svg" in head.lower())
+                if (looks_svg and _HAS_SVG
+                        and getattr(self._runtime, "media", None) is not None):
+                    parsed = _parse_svg(svg_bytes)
+                    if parsed["polylines"]:
+                        aid = _svg_aid(url)
+                        reg = self._runtime.matrix
+                        if not reg.has(aid):
+                            reg.create(aid, S="media:svg", E=url, T=70.0,
+                                       metadata={"polylines": parsed["polylines"],
+                                                 "viewbox": parsed["viewbox"]})
+                        self._media_kind[url] = "vector"; self._media_aid[url] = aid
+                        self._status[url] = "ready"
+                    else:
+                        self._status[url] = "error"
+                    changed.add(url)
+                    continue
                 if sha not in self._orig:
                     surf = pygame.image.load(io.BytesIO(data))
                     if surf.get_width() * surf.get_height() > self.max_pixels:
@@ -158,6 +210,14 @@ class ImageLoader:
 
     def status(self, url: str) -> str:
         return self._status.get(url, "empty")
+
+    def media_kind(self, url: str):
+        """Rodzaj medium wykryty po treści ('gif'|'vector') albo None."""
+        return self._media_kind.get(url)
+
+    def media_aid(self, url: str):
+        """Atom_id medium dla danego url (po detekcji) albo None."""
+        return self._media_aid.get(url)
 
     def intrinsic_size(self, url: str):
         """Realne wymiary (w, h) zdekodowanego obrazu albo None."""
